@@ -798,6 +798,11 @@ void initCommandOptions(CommandOptions& options)
          "-llvm-features",
          "-llvm-features <a1,+enable,-disable,...>",
          "Sets a comma-separates list of architecture-specific features for the LLVM targets."},
+        {OptionKind::MetalRTDispatchDimsBufferSlot,
+         "-fmetal-rt-dispatch-dims-buffer-slot",
+         "-fmetal-rt-dispatch-dims-buffer-slot <N>",
+         "Specify the Metal buffer slot index used to pass dispatch dimensions "
+         "for ray tracing shaders lowered to compute (default: 30)."},
     };
 
     _addOptions(makeConstArrayView(targetOpts), options);
@@ -3263,6 +3268,13 @@ SlangResult OptionsParser::_parse(int argc, char const* const* argv)
                 Int index = 0;
                 SLANG_RETURN_ON_FAIL(_expectInt(arg, index));
                 linkage->m_optionSet.add(OptionKind::BindlessSpaceIndex, (int)index);
+                break;
+            }
+        case OptionKind::MetalRTDispatchDimsBufferSlot:
+            {
+                Int slot = 0;
+                SLANG_RETURN_ON_FAIL(_expectInt(arg, slot));
+                linkage->m_optionSet.add(OptionKind::MetalRTDispatchDimsBufferSlot, (int)slot);
                 break;
             }
         case OptionKind::DumpModule:

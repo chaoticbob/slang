@@ -1120,6 +1120,9 @@ typedef uint32_t SlangSizeT;
 
         DiagnosticColor, // intValue0: SlangDiagnosticColor (always, never, auto)
 
+        MetalRTDispatchDimsBufferSlot, // int, buffer slot index for dispatch dimensions in
+                                       // Metal ray tracing (default 30)
+
         CountOf,
     };
 

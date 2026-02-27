@@ -217,6 +217,8 @@ CompilerOptionValue Slang::CompilerOptionSet::getDefault(CompilerOptionName name
         return CompilerOptionValue::fromEnum(OptimizationLevel::Default);
     case CompilerOptionName::LanguageVersion:
         return CompilerOptionValue::fromEnum(SLANG_LANGAUGE_VERSION_DEFAULT);
+    case CompilerOptionName::MetalRTDispatchDimsBufferSlot:
+        return CompilerOptionValue::fromInt(30);
     default:
         return CompilerOptionValue();
     }

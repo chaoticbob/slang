@@ -3,6 +3,7 @@
 
 #include "slang-ir-insts.h"
 #include "slang-ir.h"
+#include "slang-target-program.h"
 
 namespace Slang
 {
@@ -46,7 +47,7 @@ static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
     return MetalRTIntrinsic::None;
 }
 
-static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder)
+static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispatchDimsBufferSlot)
 {
     auto firstBlock = func->getFirstBlock();
     if (!firstBlock)
@@ -65,7 +66,9 @@ static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder)
     // 2. Add dispatch dimensions parameter (passed as constant buffer at [[buffer(30)]]).
     auto dimsParam = builder.emitParam(uint3Type);
     builder.addNameHintDecoration(dimsParam, toSlice("_metalrt_dispatch_dimensions"));
-    builder.addTargetSystemValueDecoration(dimsParam, toSlice("buffer(30)"));
+    StringBuilder bufferSlotStr;
+    bufferSlotStr << "buffer(" << dispatchDimsBufferSlot << ")";
+    builder.addTargetSystemValueDecoration(dimsParam, bufferSlotStr.getUnownedSlice());
 
     // 3. Replace intrinsic calls with the new parameters.
     List<IRCall*> callsToRemove;
@@ -131,8 +134,10 @@ static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder)
 
 void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, DiagnosticSink* sink)
 {
-    SLANG_UNUSED(targetProgram);
     SLANG_UNUSED(sink);
+
+    int dispatchDimsBufferSlot =
+        targetProgram->getOptionSet().getIntOption(CompilerOptionName::MetalRTDispatchDimsBufferSlot);
 
     IRBuilder builder(module);
 
@@ -150,7 +155,7 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         if (stage != Stage::RayGeneration)
             continue;
 
-        legalizeRaygenEntryPoint(func, builder);
+        legalizeRaygenEntryPoint(func, builder, dispatchDimsBufferSlot);
     }
 }
 
