@@ -19475,7 +19475,7 @@ bool ReportHitOptix(float tHit, uint hitKind, expand each T attribs)
 /// Ignores the current intersection and continues traversal.
 /// @remarks Used in any-hit shaders to reject potential intersections
 /// @category raytracing
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit)]
 void IgnoreHit()
 {
     __target_switch
@@ -19483,6 +19483,7 @@ void IgnoreHit()
     case hlsl: __intrinsic_asm "IgnoreHit";
     case glsl: __intrinsic_asm "ignoreIntersectionEXT;";
     case cuda: __intrinsic_asm "optixIgnoreIntersection";
+    case metal: __intrinsic_asm "IgnoreHit";
     case spirv:
         spirv_asm
         {
@@ -19495,7 +19496,7 @@ void IgnoreHit()
 /// Accepts the current intersection and terminates further traversal.
 /// @remarks Used in any-hit shaders to immediately accept an intersection
 /// @category raytracing
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit)]
 void AcceptHitAndEndSearch()
 {
     __target_switch
@@ -19503,6 +19504,7 @@ void AcceptHitAndEndSearch()
     case hlsl: __intrinsic_asm "AcceptHitAndEndSearch";
     case glsl: __intrinsic_asm "terminateRayEXT;";
     case cuda: __intrinsic_asm "optixTerminateRay";
+    case metal: __intrinsic_asm "AcceptHitAndEndSearch";
     case spirv:
         spirv_asm
         {

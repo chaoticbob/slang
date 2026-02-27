@@ -40,6 +40,8 @@ enum class MetalRTIntrinsic
     InstanceID,
     PrimitiveIndex,
     HitKind,
+    IgnoreHit,
+    AcceptHitAndEndSearch,
 };
 
 static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
@@ -74,6 +76,10 @@ static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
             return MetalRTIntrinsic::PrimitiveIndex;
         if (name == toSlice("HitKind"))
             return MetalRTIntrinsic::HitKind;
+        if (name == toSlice("IgnoreHit"))
+            return MetalRTIntrinsic::IgnoreHit;
+        if (name == toSlice("AcceptHitAndEndSearch"))
+            return MetalRTIntrinsic::AcceptHitAndEndSearch;
     }
     return MetalRTIntrinsic::None;
 }
@@ -168,6 +174,7 @@ struct RTEntryPoints
     IRFunc* raygen = nullptr;
     IRFunc* closestHit = nullptr;
     IRFunc* miss = nullptr;
+    IRFunc* anyHit = nullptr;
 };
 
 // Check if a struct type has the name "BuiltInTriangleIntersectionAttributes".
@@ -212,6 +219,9 @@ static RTEntryPoints findRTEntryPoints(IRModule* module)
             break;
         case Stage::Miss:
             result.miss = func;
+            break;
+        case Stage::AnyHit:
+            result.anyHit = func;
             break;
         }
     }
@@ -868,6 +878,265 @@ static void legalizeVisibleFunction(
     fixUpFuncType(func);
 }
 
+// Phase 4: Transform an AnyHit function into a Metal [[intersection(triangle, instancing)]]
+// function with bool return type.
+//
+// Before: function takes payload (inout) and attrs through entryPointParams global,
+//         uses IgnoreHit()/AcceptHitAndEndSearch() intrinsics, returns void.
+// After:  function takes barycentrics/primitiveId/instanceId as system-value params,
+//         returns bool (false = ignore hit, true = accept hit).
+//         No payload parameter (Metal intersection functions can't access payload).
+static void legalizeAnyHitFunction(
+    IRFunc* func,
+    IRBuilder& builder,
+    IRModule* module)
+{
+    auto firstBlock = func->getFirstBlock();
+    if (!firstBlock)
+    {
+        return;
+    }
+
+    auto epParamsGlobal = findEntryPointParamsGlobal(module, func);
+
+    // Scan entryPointParams field accesses to find payload and attrs fields.
+    IRType* attrsType = nullptr;
+
+    struct LoadReplacement
+    {
+        IRInst* load;
+        bool isPayload;
+        bool isAttrs;
+    };
+    List<LoadReplacement> loadReplacements;
+    List<IRInst*> fieldAddrsToRemove;
+    List<IRInst*> loadsToRemove;
+
+    if (epParamsGlobal)
+    {
+        for (auto block : func->getBlocks())
+        {
+            for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+            {
+                if (inst->getOp() != kIROp_FieldAddress)
+                {
+                    continue;
+                }
+                auto fieldAddr = as<IRFieldAddress>(inst);
+                if (fieldAddr->getBase() != epParamsGlobal)
+                {
+                    continue;
+                }
+
+                auto fieldPtrType = cast<IRPtrTypeBase>(fieldAddr->getDataType());
+                auto fieldType = fieldPtrType->getValueType();
+                bool isPayloadField = (fieldType->getOp() == kIROp_BorrowInOutParamType);
+                bool isAttrsField = isTriangleIntersectionAttrsType(fieldType);
+
+                if (isAttrsField)
+                {
+                    attrsType = fieldType;
+                }
+
+                fieldAddrsToRemove.add(fieldAddr);
+
+                for (auto use = fieldAddr->firstUse; use; use = use->nextUse)
+                {
+                    auto load = as<IRLoad>(use->getUser());
+                    if (!load)
+                    {
+                        continue;
+                    }
+                    LoadReplacement rep;
+                    rep.load = load;
+                    rep.isPayload = isPayloadField;
+                    rep.isAttrs = isAttrsField;
+                    loadReplacements.add(rep);
+                    loadsToRemove.add(load);
+                }
+            }
+        }
+    }
+
+    // Add new function parameters to the first block.
+    builder.setInsertInto(firstBlock);
+
+    auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
+    auto uintType = builder.getBasicType(BaseType::UInt);
+
+    // Barycentrics parameter with [[barycentric_coord]].
+    auto baryParam = builder.emitParam(float2Type);
+    builder.addNameHintDecoration(baryParam, toSlice("barycentrics"));
+    builder.addTargetSystemValueDecoration(baryParam, toSlice("barycentric_coord"));
+
+    // PrimitiveId parameter with [[primitive_id]].
+    auto primIdParam = builder.emitParam(uintType);
+    builder.addNameHintDecoration(primIdParam, toSlice("primitiveId"));
+    builder.addTargetSystemValueDecoration(primIdParam, toSlice("primitive_id"));
+
+    // InstanceId parameter with [[instance_id]].
+    auto instIdParam = builder.emitParam(uintType);
+    builder.addNameHintDecoration(instIdParam, toSlice("instanceId"));
+    builder.addTargetSystemValueDecoration(instIdParam, toSlice("instance_id"));
+
+    // Replace entryPointParams load results.
+    for (auto& rep : loadReplacements)
+    {
+        if (rep.isPayload)
+        {
+            // Payload access not supported in Metal intersection functions.
+            // Remove all uses — they'll become dead code.
+            rep.load->replaceUsesWith(nullptr);
+        }
+        else if (rep.isAttrs && baryParam)
+        {
+            // Construct BuiltInTriangleIntersectionAttributes struct from barycentrics param.
+            auto insertPoint = firstBlock->getFirstOrdinaryInst();
+            if (insertPoint)
+            {
+                builder.setInsertBefore(insertPoint);
+            }
+            else
+            {
+                builder.setInsertInto(firstBlock);
+            }
+
+            auto attrsVar = builder.emitVar(attrsType);
+            auto attrsStructType = as<IRStructType>(attrsType);
+            if (attrsStructType)
+            {
+                for (auto field : attrsStructType->getFields())
+                {
+                    auto fieldAddr2 = builder.emitFieldAddress(
+                        builder.getPtrType(field->getFieldType()),
+                        attrsVar,
+                        field->getKey());
+                    builder.emitStore(fieldAddr2, baryParam);
+                }
+            }
+            auto attrsVal = builder.emitLoad(attrsType, attrsVar);
+            rep.load->replaceUsesWith(attrsVal);
+        }
+    }
+
+    // Replace RT intrinsic calls and IgnoreHit/AcceptHitAndEndSearch.
+    auto boolType = builder.getBoolType();
+    auto boolTrue = builder.getBoolValue(true);
+    auto boolFalse = builder.getBoolValue(false);
+
+    List<IRInst*> instsToRemove;
+    for (auto block : func->getBlocks())
+    {
+        for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+        {
+            // Replace void returns with `return true` (accept hit by default).
+            if (auto retInst = as<IRReturn>(inst))
+            {
+                builder.setInsertBefore(retInst);
+                builder.emitReturn(boolTrue);
+                instsToRemove.add(retInst);
+                continue;
+            }
+
+            auto call = as<IRCall>(inst);
+            if (!call)
+            {
+                continue;
+            }
+
+            auto intrinsicKind = getMetalRTIntrinsicFromCall(call);
+            if (intrinsicKind == MetalRTIntrinsic::None)
+            {
+                continue;
+            }
+
+            IRInst* replacement = nullptr;
+            switch (intrinsicKind)
+            {
+            default:
+                {
+                }
+                break;
+            case MetalRTIntrinsic::IgnoreHit:
+                {
+                    // IgnoreHit() -> return false
+                    builder.setInsertBefore(call);
+                    builder.emitReturn(boolFalse);
+                    instsToRemove.add(call);
+                }
+                break;
+            case MetalRTIntrinsic::AcceptHitAndEndSearch:
+                {
+                    // AcceptHitAndEndSearch() -> return true
+                    builder.setInsertBefore(call);
+                    builder.emitReturn(boolTrue);
+                    instsToRemove.add(call);
+                }
+                break;
+            case MetalRTIntrinsic::PrimitiveIndex:
+                {
+                    replacement = primIdParam;
+                }
+                break;
+            case MetalRTIntrinsic::InstanceIndex:
+            case MetalRTIntrinsic::InstanceID:
+                {
+                    replacement = instIdParam;
+                }
+                break;
+            case MetalRTIntrinsic::HitKind:
+                {
+                    // No frontFacing param available — use constant for front face.
+                    replacement = builder.getIntValue(uintType, 254);
+                }
+                break;
+            }
+
+            if (replacement)
+            {
+                call->replaceUsesWith(replacement);
+                instsToRemove.add(call);
+            }
+        }
+    }
+
+    // Remove replaced instructions.
+    for (auto inst : instsToRemove)
+    {
+        inst->removeAndDeallocate();
+    }
+    for (auto load : loadsToRemove)
+    {
+        load->removeAndDeallocate();
+    }
+    for (auto fieldAddr : fieldAddrsToRemove)
+    {
+        fieldAddr->removeAndDeallocate();
+    }
+
+    // Remove the entryPointParams global for this function.
+    if (epParamsGlobal)
+    {
+        epParamsGlobal->removeAndDeallocate();
+    }
+
+    // Change the function return type to bool.
+    auto funcType = as<IRFuncType>(func->getDataType());
+    if (funcType)
+    {
+        List<IRType*> paramTypes;
+        for (UInt i = 0; i < funcType->getParamCount(); i++)
+        {
+            paramTypes.add(funcType->getParamType(i));
+        }
+        auto newFuncType = builder.getFuncType(paramTypes, boolType);
+        func->setFullType(newFuncType);
+    }
+
+    // Fix up the function type to match the new parameter list.
+    fixUpFuncType(func);
+}
+
 // Phase 3: Replace TraceRay calls in the raygen function with intersector +
 // calls to visible closesthit/miss functions (instead of inlining their bodies).
 static void legalizeTraceRayCallsWithVisibleFunctions(
@@ -1112,8 +1381,14 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         }
     }
 
-    // Do NOT call removeNonRaygenEntryPoints — closesthit/miss stay as entry points
-    // for [[visible]] function emission.
+    // Phase 4: Transform AnyHit into [[intersection(triangle, instancing)]] function.
+    if (entryPoints.anyHit)
+    {
+        legalizeAnyHitFunction(entryPoints.anyHit, builder, module);
+    }
+
+    // Do NOT call removeNonRaygenEntryPoints — closesthit/miss/anyhit stay as entry points
+    // for [[visible]]/[[intersection()]] function emission.
 }
 
 } // namespace Slang

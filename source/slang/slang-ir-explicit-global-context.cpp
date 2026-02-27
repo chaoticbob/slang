@@ -279,11 +279,11 @@ struct IntroduceExplicitGlobalContextPass
                     if (!entryPointDecor)
                         continue;
 
-                    // Skip RT visible functions (ClosestHit/Miss) — they are
+                    // Skip RT functions (ClosestHit/Miss/AnyHit) — they are
                     // legalized by legalizeIRForMetalRT and must not receive
                     // global context resource params.
                     auto stage = entryPointDecor->getProfile().getStage();
-                    if (stage == Stage::ClosestHit || stage == Stage::Miss)
+                    if (stage == Stage::ClosestHit || stage == Stage::Miss || stage == Stage::AnyHit)
                         continue;
 
                     m_entryPoints.add(func);

@@ -26,6 +26,11 @@ void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
             m_writer->emit("[[visible]] ");
         }
         break;
+    case Stage::AnyHit:
+        {
+            m_writer->emit("[[intersection(triangle, instancing)]] ");
+        }
+        break;
     default:
         {
             Super::emitEntryPointAttributesImpl(irFunc, entryPointDecor);
