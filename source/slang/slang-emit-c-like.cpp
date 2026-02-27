@@ -1460,6 +1460,7 @@ bool CLikeSourceEmitter::shouldFoldInstIntoUseSites(IRInst* inst)
     case kIROp_UpdateElement:
     case kIROp_DefaultConstruct:
     case kIROp_MetalCastToDepthTexture:
+    case kIROp_MetalRTIntersect:
     case kIROp_LoadResourceDescriptorFromHeap:
     case kIROp_LoadSamplerDescriptorFromHeap:
         return false;
@@ -3237,6 +3238,7 @@ void CLikeSourceEmitter::_emitInst(IRInst* inst)
     case kIROp_StructuredBufferGetDimensions:
     case kIROp_MetalAtomicCast:
     case kIROp_MetalCastToDepthTexture:
+    case kIROp_MetalRTIntersect:
     case kIROp_SetOptiXPayloadRegister:
         emitInstStmt(inst);
         break;

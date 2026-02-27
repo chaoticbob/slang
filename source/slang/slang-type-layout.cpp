@@ -2801,17 +2801,17 @@ LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getShaderStorageBufferRules(Compile
 
 LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getRayPayloadParameterRules()
 {
-    return nullptr;
+    return &kMetalConstantBufferLayoutRulesImpl_;
 }
 
 LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getCallablePayloadParameterRules()
 {
-    return nullptr;
+    return &kMetalConstantBufferLayoutRulesImpl_;
 }
 
 LayoutRulesImpl* MetalLayoutRulesFamilyImpl::getHitAttributesParameterRules()
 {
-    return nullptr;
+    return &kMetalConstantBufferLayoutRulesImpl_;
 }
 
 LayoutRulesImpl* MetalArgumentBufferTier2LayoutRulesFamilyImpl::getConstantBufferRules(

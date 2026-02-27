@@ -736,4 +736,11 @@ return {
 	["SPIRVSamplerHeap"] = 734,
 	["SPIRVLoadDescriptorFromHeap"] = 735,
 	["SPIRVLoadTexelPointerFromHeap"] = 736,
+	["MetalRTIntersect"] = 737,
+	["MetalRTIntersectionGetType"] = 738,
+	["MetalRTIntersectionGetDistance"] = 739,
+	["MetalRTIntersectionGetPrimitiveId"] = 740,
+	["MetalRTIntersectionGetInstanceId"] = 741,
+	["MetalRTIntersectionGetBarycentrics"] = 742,
+	["MetalRTIntersectionGetFrontFace"] = 743,
 }

@@ -20,6 +20,11 @@ public:
 protected:
     virtual void emitFrontMatterImpl(TargetRequest* targetReq) SLANG_OVERRIDE;
     virtual void emitSimpleFuncParamImpl(IRParam* param) SLANG_OVERRIDE;
+    virtual bool tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inOuterPrec) SLANG_OVERRIDE;
+    virtual bool tryEmitInstStmtImpl(IRInst* inst) SLANG_OVERRIDE;
+
+private:
+    int m_intersectorCounter = 0;
 };
 
 } // namespace Slang

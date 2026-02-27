@@ -19057,7 +19057,7 @@ struct RaytracingAccelerationStructure
 /// Built-in structure containing intersection attributes for triangle primitives.
 /// @category raytracing
 __target_intrinsic(hlsl, BuiltInTriangleIntersectionAttributes)
-[require(cpp_cuda_glsl_hlsl_spirv, raytracing)]
+[require(cpp_cuda_glsl_hlsl_metal_spirv, raytracing)]
 struct BuiltInTriangleIntersectionAttributes
 {
     /// Barycentric coordinates of the intersection point on the triangle.
@@ -19200,6 +19200,17 @@ __generic<Payload>
 __intrinsic_op($(kIROp_GetVulkanRayTracingPayloadLocation))
 int __rayPayloadLocation(__ref Payload payload);
 
+__generic<payload_t>
+[require(metal, raytracing_raygen_closesthit_miss)]
+void __metalrt_TraceRay(
+    RaytracingAccelerationStructure AccelerationStructure,
+    uint RayFlags, uint InstanceInclusionMask,
+    float3 Origin, float TMin, float3 Direction, float TMax,
+    inout payload_t Payload)
+{
+    __target_switch { case metal: __intrinsic_asm "(_metalrt_TraceRay)"; }
+}
+
 /// Traces a ray through the acceleration structure.
 /// @param AccelerationStructure The acceleration structure to traverse
 /// @param RayFlags Flags controlling ray behavior
@@ -19213,7 +19224,7 @@ int __rayPayloadLocation(__ref Payload payload);
 /// @category raytracing
 [ForceInline]
 __generic<payload_t>
-[require(cuda_glsl_hlsl_spirv, raytracing_raygen_closesthit_miss)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_raygen_closesthit_miss)]
 void TraceRay(
     RaytracingAccelerationStructure AccelerationStructure,
     uint                            RayFlags,
@@ -19238,6 +19249,10 @@ void TraceRay(
             __forceVarIntoRayPayloadStructTemporarily(Payload));
         return;
     case cuda: __intrinsic_asm "optixTrace";
+    case metal:
+        __metalrt_TraceRay(AccelerationStructure, RayFlags, InstanceInclusionMask,
+            Ray.Origin, Ray.TMin, Ray.Direction, Ray.TMax, Payload);
+        return;
     case glsl:
     {
         [__vulkanRayPayload]
@@ -19553,7 +19568,7 @@ uint3 DispatchRaysDimensions()
 /// @remarks Available in any-hit, closest-hit, intersection, and miss shaders
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection_miss)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection_miss)]
 float3 WorldRayOrigin()
 {
     __target_switch
@@ -19561,6 +19576,7 @@ float3 WorldRayOrigin()
     case hlsl:  __intrinsic_asm "WorldRayOrigin";
     case glsl: __intrinsic_asm "(gl_WorldRayOriginEXT)";
     case cuda: __intrinsic_asm "optixGetWorldRayOrigin";
+    case metal: __intrinsic_asm "(_metalrt_WorldRayOrigin)";
     case spirv:
         return spirv_asm
         {
@@ -19574,7 +19590,7 @@ float3 WorldRayOrigin()
 /// @remarks Available in any-hit, closest-hit, intersection, and miss shaders
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection_miss)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection_miss)]
 float3 WorldRayDirection()
 {
     __target_switch
@@ -19582,6 +19598,7 @@ float3 WorldRayDirection()
     case hlsl:  __intrinsic_asm "WorldRayDirection";
     case glsl: __intrinsic_asm "(gl_WorldRayDirectionEXT)";
     case cuda: __intrinsic_asm "optixGetWorldRayDirection";
+    case metal: __intrinsic_asm "(_metalrt_WorldRayDirection)";
     case spirv:
         return spirv_asm
         {
@@ -19595,7 +19612,7 @@ float3 WorldRayDirection()
 /// @remarks Used to prevent self-intersections and near-plane clipping
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection_miss)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection_miss)]
 float RayTMin()
 {
     __target_switch
@@ -19603,6 +19620,7 @@ float RayTMin()
     case hlsl:  __intrinsic_asm "RayTMin";
     case glsl: __intrinsic_asm "(gl_RayTminEXT)";
     case cuda: __intrinsic_asm "optixGetRayTmin";
+    case metal: __intrinsic_asm "(_metalrt_RayTMin)";
     case spirv:
         return spirv_asm
         {
@@ -19627,7 +19645,7 @@ float RayTMin()
 /// @remarks Interpretation depends on shader stage (hit vs. intersection)
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection_miss)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection_miss)]
 float RayTCurrent()
 {
     __target_switch
@@ -19635,6 +19653,7 @@ float RayTCurrent()
     case hlsl:  __intrinsic_asm "RayTCurrent";
     case glsl: __intrinsic_asm "(gl_RayTmaxEXT)";
     case cuda: __intrinsic_asm "optixGetRayTmax";
+    case metal: __intrinsic_asm "(_metalrt_RayTCurrent)";
     case spirv:
         return spirv_asm
         {
@@ -19647,7 +19666,7 @@ float RayTCurrent()
 /// @return Combination of RAY_FLAG values used for this ray
 /// @remarks Allows shaders to modify behavior based on ray trace flags
 /// @category raytracing
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection_miss)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection_miss)]
 uint RayFlags()
 {
     __target_switch
@@ -19655,6 +19674,7 @@ uint RayFlags()
     case hlsl:  __intrinsic_asm "RayFlags";
     case glsl: __intrinsic_asm "(gl_IncomingRayFlagsEXT)";
     case cuda: __intrinsic_asm "optixGetRayFlags";
+    case metal: __intrinsic_asm "(_metalrt_RayFlags)";
     case spirv:
         return spirv_asm
         {
@@ -19670,7 +19690,7 @@ uint RayFlags()
 /// @remarks Available in any-hit, closest-hit, and intersection shaders
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 uint InstanceIndex()
 {
     __target_switch
@@ -19678,6 +19698,7 @@ uint InstanceIndex()
     case hlsl:  __intrinsic_asm "InstanceIndex";
     case glsl: __intrinsic_asm "(gl_InstanceID)";
     case cuda: __intrinsic_asm "optixGetInstanceIndex";
+    case metal: __intrinsic_asm "(_metalrt_InstanceIndex)";
     case spirv:
         return spirv_asm
         {
@@ -19691,7 +19712,7 @@ uint InstanceIndex()
 /// @remarks Used for instance-specific shader behavior
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 uint InstanceID()
 {
     __target_switch
@@ -19699,6 +19720,7 @@ uint InstanceID()
     case hlsl:  __intrinsic_asm "InstanceID";
     case glsl: __intrinsic_asm "(gl_InstanceCustomIndexEXT)";
     case cuda: __intrinsic_asm "optixGetInstanceId";
+    case metal: __intrinsic_asm "(_metalrt_InstanceID)";
     case spirv:
         return spirv_asm
         {
@@ -19712,7 +19734,7 @@ uint InstanceID()
 /// @remarks Available in any-hit, closest-hit, and intersection shaders
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 uint PrimitiveIndex()
 {
     __target_switch
@@ -19720,6 +19742,7 @@ uint PrimitiveIndex()
     case hlsl:  __intrinsic_asm "PrimitiveIndex";
     case glsl: __intrinsic_asm "(gl_PrimitiveID)";
     case cuda: __intrinsic_asm "optixGetPrimitiveIndex";
+    case metal: __intrinsic_asm "(_metalrt_PrimitiveIndex)";
     case spirv:
         return spirv_asm
         {
@@ -20035,7 +20058,7 @@ bool IsLssHit()
 /// @remarks Available in any-hit and closest-hit shaders
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit)]
 uint HitKind()
 {
     __target_switch
@@ -20043,6 +20066,7 @@ uint HitKind()
     case hlsl:  __intrinsic_asm "HitKind";
     case glsl: __intrinsic_asm "(gl_HitKindEXT)";
     case cuda:  __intrinsic_asm "optixGetHitKind";
+    case metal: __intrinsic_asm "(_metalrt_HitKind)";
     case spirv:
         return spirv_asm
         {

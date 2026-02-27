@@ -2172,8 +2172,16 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
             }
         case SourceLanguage::Metal:
             {
-                if (desc.entryPointStage != Stage::Unknown &&
-                    isRaytracingStage(desc.entryPointStage))
+                bool hasRTEntryPoints = false;
+                for (Index i = 0; i < getEntryPointCount(); i++)
+                {
+                    if (isRaytracingStage(getEntryPoint(i)->getStage()))
+                    {
+                        hasRTEntryPoints = true;
+                        break;
+                    }
+                }
+                if (hasRTEntryPoints)
                     sourceEmitter = new MetalRTSourceEmitter(desc);
                 else
                     sourceEmitter = new MetalSourceEmitter(desc);
