@@ -275,7 +275,15 @@ struct IntroduceExplicitGlobalContextPass
                     // that represent entry points.
                     //
                     auto func = cast<IRFunc>(inst);
-                    if (!func->findDecoration<IREntryPointDecoration>())
+                    auto entryPointDecor = func->findDecoration<IREntryPointDecoration>();
+                    if (!entryPointDecor)
+                        continue;
+
+                    // Skip RT visible functions (ClosestHit/Miss) — they are
+                    // legalized by legalizeIRForMetalRT and must not receive
+                    // global context resource params.
+                    auto stage = entryPointDecor->getProfile().getStage();
+                    if (stage == Stage::ClosestHit || stage == Stage::Miss)
                         continue;
 
                     m_entryPoints.add(func);

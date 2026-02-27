@@ -13,6 +13,27 @@ void MetalRTSourceEmitter::emitFrontMatterImpl(TargetRequest* targetReq)
     m_writer->emit("using namespace metal::raytracing;\n");
 }
 
+void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
+    IRFunc* irFunc,
+    IREntryPointDecoration* entryPointDecor)
+{
+    auto stage = entryPointDecor->getProfile().getStage();
+    switch (stage)
+    {
+    case Stage::ClosestHit:
+    case Stage::Miss:
+        {
+            m_writer->emit("[[visible]] ");
+        }
+        break;
+    default:
+        {
+            Super::emitEntryPointAttributesImpl(irFunc, entryPointDecor);
+        }
+        break;
+    }
+}
+
 void MetalRTSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
 {
     // Check if this is a _metalrt_* param with a buffer binding.

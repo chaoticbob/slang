@@ -606,6 +606,414 @@ static void legalizeTraceRayCalls(IRFunc* raygenFunc, const RTEntryPoints& entry
     }
 }
 
+// Phase 3: Transform a closesthit or miss function into a [[visible]] function
+// with explicit parameters for payload and intersection data.
+//
+// Before: function accesses payload/attrs through entryPointParams global,
+//         uses RT intrinsic calls for intersection data.
+// After:  function takes device PayloadType* and intersection data as plain params.
+static void legalizeVisibleFunction(
+    IRFunc* func,
+    IRBuilder& builder,
+    IRModule* module,
+    bool isClosestHit)
+{
+    auto firstBlock = func->getFirstBlock();
+    if (!firstBlock)
+    {
+        return;
+    }
+
+    auto epParamsGlobal = findEntryPointParamsGlobal(module, func);
+
+    // Scan entryPointParams field accesses to determine payload/attrs types.
+    IRType* payloadStructType = nullptr;
+    IRType* attrsType = nullptr;
+
+    struct LoadReplacement
+    {
+        IRInst* load;
+        bool isPayload;
+        bool isAttrs;
+    };
+    List<LoadReplacement> loadReplacements;
+    List<IRInst*> fieldAddrsToRemove;
+    List<IRInst*> loadsToRemove;
+
+    if (epParamsGlobal)
+    {
+        for (auto block : func->getBlocks())
+        {
+            for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+            {
+                if (inst->getOp() != kIROp_FieldAddress)
+                {
+                    continue;
+                }
+                auto fieldAddr = as<IRFieldAddress>(inst);
+                if (fieldAddr->getBase() != epParamsGlobal)
+                {
+                    continue;
+                }
+
+                auto fieldPtrType = cast<IRPtrTypeBase>(fieldAddr->getDataType());
+                auto fieldType = fieldPtrType->getValueType();
+                bool isPayloadField = (fieldType->getOp() == kIROp_BorrowInOutParamType);
+                bool isAttrsField = isTriangleIntersectionAttrsType(fieldType);
+
+                if (isPayloadField)
+                {
+                    payloadStructType = cast<IRPtrTypeBase>(fieldType)->getValueType();
+                }
+                if (isAttrsField)
+                {
+                    attrsType = fieldType;
+                }
+
+                fieldAddrsToRemove.add(fieldAddr);
+
+                for (auto use = fieldAddr->firstUse; use; use = use->nextUse)
+                {
+                    auto load = as<IRLoad>(use->getUser());
+                    if (!load)
+                    {
+                        continue;
+                    }
+                    LoadReplacement rep;
+                    rep.load = load;
+                    rep.isPayload = isPayloadField;
+                    rep.isAttrs = isAttrsField;
+                    loadReplacements.add(rep);
+                    loadsToRemove.add(load);
+                }
+            }
+        }
+    }
+
+    // Add new function parameters to the first block.
+    builder.setInsertInto(firstBlock);
+
+    // Payload parameter: device PayloadType*.
+    IRInst* payloadParam = nullptr;
+    if (payloadStructType)
+    {
+        auto payloadPtrType = builder.getPtrType(payloadStructType, AddressSpace::Global);
+        payloadParam = builder.emitParam(payloadPtrType);
+        builder.addNameHintDecoration(payloadParam, toSlice("payload"));
+    }
+
+    // Intersection data parameters (closesthit only).
+    IRInst* baryParam = nullptr;
+    IRInst* distParam = nullptr;
+    IRInst* primIdParam = nullptr;
+    IRInst* instIdParam = nullptr;
+    IRInst* frontFacingParam = nullptr;
+
+    if (isClosestHit)
+    {
+        auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
+        auto floatType = builder.getBasicType(BaseType::Float);
+        auto uintType = builder.getBasicType(BaseType::UInt);
+        auto boolType = builder.getBoolType();
+
+        baryParam = builder.emitParam(float2Type);
+        builder.addNameHintDecoration(baryParam, toSlice("barycentrics"));
+
+        distParam = builder.emitParam(floatType);
+        builder.addNameHintDecoration(distParam, toSlice("distance"));
+
+        primIdParam = builder.emitParam(uintType);
+        builder.addNameHintDecoration(primIdParam, toSlice("primitiveId"));
+
+        instIdParam = builder.emitParam(uintType);
+        builder.addNameHintDecoration(instIdParam, toSlice("instanceId"));
+
+        frontFacingParam = builder.emitParam(boolType);
+        builder.addNameHintDecoration(frontFacingParam, toSlice("frontFacing"));
+    }
+
+    // Replace entryPointParams load results with new parameter values.
+    for (auto& rep : loadReplacements)
+    {
+        if (rep.isPayload && payloadParam)
+        {
+            rep.load->replaceUsesWith(payloadParam);
+        }
+        else if (rep.isAttrs && isClosestHit && baryParam)
+        {
+            // Construct BuiltInTriangleIntersectionAttributes struct from barycentrics param.
+            auto insertPoint = firstBlock->getFirstOrdinaryInst();
+            if (insertPoint)
+            {
+                builder.setInsertBefore(insertPoint);
+            }
+            else
+            {
+                builder.setInsertInto(firstBlock);
+            }
+
+            auto attrsVar = builder.emitVar(attrsType);
+            auto attrsStructType = as<IRStructType>(attrsType);
+            if (attrsStructType)
+            {
+                for (auto field : attrsStructType->getFields())
+                {
+                    auto fieldAddr2 = builder.emitFieldAddress(
+                        builder.getPtrType(field->getFieldType()),
+                        attrsVar,
+                        field->getKey());
+                    builder.emitStore(fieldAddr2, baryParam);
+                }
+            }
+            auto attrsVal = builder.emitLoad(attrsType, attrsVar);
+            rep.load->replaceUsesWith(attrsVal);
+        }
+    }
+
+    // Replace RT intrinsic calls with new function parameters.
+    List<IRCall*> intrinsicCallsToRemove;
+    for (auto block : func->getBlocks())
+    {
+        for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+        {
+            auto call = as<IRCall>(inst);
+            if (!call)
+            {
+                continue;
+            }
+
+            auto intrinsicKind = getMetalRTIntrinsicFromCall(call);
+            if (intrinsicKind == MetalRTIntrinsic::None)
+            {
+                continue;
+            }
+
+            IRInst* replacement = nullptr;
+            switch (intrinsicKind)
+            {
+            default:
+                {
+                }
+                break;
+            case MetalRTIntrinsic::RayTCurrent:
+                {
+                    if (isClosestHit && distParam)
+                    {
+                        replacement = distParam;
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::PrimitiveIndex:
+                {
+                    if (isClosestHit && primIdParam)
+                    {
+                        replacement = primIdParam;
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::InstanceIndex:
+            case MetalRTIntrinsic::InstanceID:
+                {
+                    if (isClosestHit && instIdParam)
+                    {
+                        replacement = instIdParam;
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::HitKind:
+                {
+                    if (isClosestHit && frontFacingParam)
+                    {
+                        builder.setInsertBefore(call);
+                        auto uintType = builder.getBasicType(BaseType::UInt);
+                        auto frontVal = builder.getIntValue(uintType, 254);
+                        auto backVal = builder.getIntValue(uintType, 255);
+                        IRInst* selectArgs[] = {frontFacingParam, frontVal, backVal};
+                        replacement =
+                            builder.emitIntrinsicInst(uintType, kIROp_Select, 3, selectArgs);
+                    }
+                }
+                break;
+            }
+
+            if (replacement)
+            {
+                call->replaceUsesWith(replacement);
+                intrinsicCallsToRemove.add(call);
+            }
+        }
+    }
+
+    // Remove replaced instructions.
+    for (auto call : intrinsicCallsToRemove)
+    {
+        call->removeAndDeallocate();
+    }
+    for (auto load : loadsToRemove)
+    {
+        load->removeAndDeallocate();
+    }
+    for (auto fieldAddr : fieldAddrsToRemove)
+    {
+        fieldAddr->removeAndDeallocate();
+    }
+
+    // Remove the entryPointParams global for this function.
+    if (epParamsGlobal)
+    {
+        epParamsGlobal->removeAndDeallocate();
+    }
+
+    // Fix up the function type to match the new parameter list.
+    fixUpFuncType(func);
+}
+
+// Phase 3: Replace TraceRay calls in the raygen function with intersector +
+// calls to visible closesthit/miss functions (instead of inlining their bodies).
+static void legalizeTraceRayCallsWithVisibleFunctions(
+    IRFunc* raygenFunc,
+    const RTEntryPoints& entryPoints,
+    IRBuilder& builder)
+{
+    // Find all TraceRay calls in the raygen function.
+    List<IRCall*> traceRayCalls;
+    for (auto block : raygenFunc->getBlocks())
+    {
+        for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+        {
+            auto call = as<IRCall>(inst);
+            if (!call)
+            {
+                continue;
+            }
+            if (getMetalRTIntrinsicFromCall(call) == MetalRTIntrinsic::TraceRay)
+            {
+                traceRayCalls.add(call);
+            }
+        }
+    }
+
+    auto uintType = builder.getBasicType(BaseType::UInt);
+
+    for (auto call : traceRayCalls)
+    {
+        // __metalrt_TraceRay args:
+        // 0: accel, 1: rayFlags, 2: instanceMask, 3: origin, 4: tMin, 5: direction, 6: tMax, 7: payload
+        auto accel = call->getArg(0);
+        auto rayFlagsArg = call->getArg(1);
+        auto instanceMask = call->getArg(2);
+        auto origin = call->getArg(3);
+        auto tMin = call->getArg(4);
+        auto direction = call->getArg(5);
+        auto tMax = call->getArg(6);
+        auto payloadPtr = call->getArg(7);
+
+        SLANG_UNUSED(origin);
+        SLANG_UNUSED(direction);
+        SLANG_UNUSED(tMin);
+        SLANG_UNUSED(tMax);
+        SLANG_UNUSED(rayFlagsArg);
+
+        // Insert before the TraceRay call.
+        builder.setInsertBefore(call);
+
+        // Emit MetalRTIntersect instruction.
+        IRInst* intersectArgs[] = {accel, origin, direction, tMin, tMax, rayFlagsArg, instanceMask};
+        auto intersectResult = builder.emitIntrinsicInst(
+            uintType, // placeholder type — emitter will use `auto`
+            kIROp_MetalRTIntersect,
+            7,
+            intersectArgs);
+
+        // Emit type check: result type != 0 means we got a hit.
+        auto intersectionType = builder.emitIntrinsicInst(
+            uintType,
+            kIROp_MetalRTIntersectionGetType,
+            1,
+            &intersectResult);
+        auto zero = builder.getIntValue(uintType, 0);
+        auto hitCondition = builder.emitNeq(intersectionType, zero);
+
+        // Create hit/miss/after blocks.
+        auto hitBlock = builder.createBlock();
+        auto missBlock = builder.createBlock();
+        auto afterBlock = builder.createBlock();
+        raygenFunc->addBlock(hitBlock);
+        raygenFunc->addBlock(missBlock);
+        raygenFunc->addBlock(afterBlock);
+
+        // Move all instructions after the TraceRay call to afterBlock.
+        {
+            List<IRInst*> instsToMove;
+            for (auto inst = call->getNextInst(); inst; inst = inst->getNextInst())
+            {
+                instsToMove.add(inst);
+            }
+            for (auto inst : instsToMove)
+            {
+                inst->insertAtEnd(afterBlock);
+            }
+        }
+
+        // Emit the if/else branch (replaces the TraceRay call as terminator).
+        builder.emitIfElse(hitCondition, hitBlock, missBlock, afterBlock);
+
+        // Remove the TraceRay call.
+        call->removeAndDeallocate();
+
+        // Hit branch: call closestHitFunc with intersection result fields as arguments.
+        builder.setInsertInto(hitBlock);
+        if (entryPoints.closestHit)
+        {
+            auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
+            auto floatType = builder.getBasicType(BaseType::Float);
+            auto boolType = builder.getBoolType();
+
+            auto barycentrics = builder.emitIntrinsicInst(
+                float2Type,
+                kIROp_MetalRTIntersectionGetBarycentrics,
+                1,
+                &intersectResult);
+            auto distance = builder.emitIntrinsicInst(
+                floatType,
+                kIROp_MetalRTIntersectionGetDistance,
+                1,
+                &intersectResult);
+            auto primitiveId = builder.emitIntrinsicInst(
+                uintType,
+                kIROp_MetalRTIntersectionGetPrimitiveId,
+                1,
+                &intersectResult);
+            auto instanceId = builder.emitIntrinsicInst(
+                uintType,
+                kIROp_MetalRTIntersectionGetInstanceId,
+                1,
+                &intersectResult);
+            auto frontFacing = builder.emitIntrinsicInst(
+                boolType,
+                kIROp_MetalRTIntersectionGetFrontFace,
+                1,
+                &intersectResult);
+
+            IRInst* hitArgs[] = {
+                payloadPtr, barycentrics, distance, primitiveId, instanceId, frontFacing};
+            builder.emitCallInst(
+                builder.getVoidType(), entryPoints.closestHit, 6, hitArgs);
+        }
+        builder.emitBranch(afterBlock);
+
+        // Miss branch: call missFunc with payload pointer only.
+        builder.setInsertInto(missBlock);
+        if (entryPoints.miss)
+        {
+            IRInst* missArgs[] = {payloadPtr};
+            builder.emitCallInst(
+                builder.getVoidType(), entryPoints.miss, 1, missArgs);
+        }
+        builder.emitBranch(afterBlock);
+    }
+}
+
 static void removeNonRaygenEntryPoints(IRModule* module)
 {
     List<IRInst*> instsToRemove;
@@ -659,29 +1067,53 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
 
     auto entryPoints = findRTEntryPoints(module);
 
+    // Phase 1: Legalize raygen entry point (compute kernel).
+    IRFunc* raygenFunc = nullptr;
     for (auto inst : module->getGlobalInsts())
     {
         auto func = as<IRFunc>(inst);
         if (!func)
+        {
             continue;
+        }
 
         auto entryPointDecor = func->findDecoration<IREntryPointDecoration>();
         if (!entryPointDecor)
+        {
             continue;
+        }
 
         auto stage = entryPointDecor->getProfile().getStage();
         if (stage != Stage::RayGeneration)
+        {
             continue;
+        }
 
         legalizeRaygenEntryPoint(func, builder, dispatchDimsBufferSlot);
+        raygenFunc = func;
+    }
 
-        if (entryPoints.closestHit || entryPoints.miss)
+    if (entryPoints.closestHit || entryPoints.miss)
+    {
+        // Phase 3: Transform closesthit/miss into [[visible]] functions.
+        if (entryPoints.closestHit)
         {
-            legalizeTraceRayCalls(func, entryPoints, builder);
+            legalizeVisibleFunction(entryPoints.closestHit, builder, module, true);
+        }
+        if (entryPoints.miss)
+        {
+            legalizeVisibleFunction(entryPoints.miss, builder, module, false);
+        }
+
+        // Replace TraceRay calls with intersector + calls to visible functions.
+        if (raygenFunc)
+        {
+            legalizeTraceRayCallsWithVisibleFunctions(raygenFunc, entryPoints, builder);
         }
     }
 
-    removeNonRaygenEntryPoints(module);
+    // Do NOT call removeNonRaygenEntryPoints — closesthit/miss stay as entry points
+    // for [[visible]] function emission.
 }
 
 } // namespace Slang
