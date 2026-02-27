@@ -16,6 +16,7 @@
 #include "slang-emit-glsl.h"
 #include "slang-emit-hlsl.h"
 #include "slang-emit-llvm.h"
+#include "slang-emit-metal-rt.h"
 #include "slang-emit-metal.h"
 #include "slang-emit-slang.h"
 #include "slang-emit-source-writer.h"
@@ -90,6 +91,7 @@
 #include "slang-ir-lower-tuple-types.h"
 #include "slang-ir-metadata.h"
 #include "slang-ir-metal-legalize.h"
+#include "slang-ir-metal-rt-legalize.h"
 #include "slang-ir-missing-return.h"
 #include "slang-ir-optix-entry-point-uniforms.h"
 #include "slang-ir-pytorch-cpp-binding.h"
@@ -1675,6 +1677,7 @@ Result linkAndOptimizeIR(
     case CodeGenTarget::MetalLib:
     case CodeGenTarget::MetalLibAssembly:
         {
+            SLANG_PASS(legalizeIRForMetalRT, targetProgram, sink);
             SLANG_PASS(legalizeIRForMetal, targetProgram, sink);
         }
         break;
@@ -2169,7 +2172,11 @@ SlangResult CodeGenContext::emitEntryPointsSourceFromIR(ComPtr<IArtifact>& outAr
             }
         case SourceLanguage::Metal:
             {
-                sourceEmitter = new MetalSourceEmitter(desc);
+                if (desc.entryPointStage != Stage::Unknown &&
+                    isRaytracingStage(desc.entryPointStage))
+                    sourceEmitter = new MetalRTSourceEmitter(desc);
+                else
+                    sourceEmitter = new MetalSourceEmitter(desc);
                 break;
             }
         case SourceLanguage::WGSL:
