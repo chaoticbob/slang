@@ -901,9 +901,8 @@ static void legalizeVisibleFunction(
                 break;
             case MetalRTIntrinsic::TraceRay:
                 {
-                    // TraceRay calls inside visible functions can't be handled yet
-                    // (requires multiple miss/closesthit dispatch). Remove them for now.
-                    intrinsicCallsToRemove.add(call);
+                    // TraceRay calls inside visible functions are handled later by
+                    // legalizeTraceRayCallsInVisibleFunctions. Skip without removing.
                     continue;
                 }
             case MetalRTIntrinsic::WorldRayOrigin:
@@ -1477,6 +1476,120 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
     }
 }
 
+// Lower TraceRay calls inside visible functions (e.g. closestHit) to intersector calls,
+// inlining the any-hit body into the hit branch for payload modification.
+// Must be called BEFORE legalizeAnyHitFunction transforms the any-hit into an
+// [[intersection]] function (which strips payload access).
+static void legalizeTraceRayCallsInVisibleFunctions(
+    IRFunc* visibleFunc,
+    const RTEntryPoints& entryPoints,
+    IRBuilder& builder)
+{
+    // Find all TraceRay calls in the visible function.
+    List<IRCall*> traceRayCalls;
+    for (auto block : visibleFunc->getBlocks())
+    {
+        for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+        {
+            auto call = as<IRCall>(inst);
+            if (!call)
+                continue;
+            if (getMetalRTIntrinsicFromCall(call) == MetalRTIntrinsic::TraceRay)
+            {
+                traceRayCalls.add(call);
+            }
+        }
+    }
+
+    auto uintType = builder.getBasicType(BaseType::UInt);
+
+    for (auto call : traceRayCalls)
+    {
+        // __metalrt_TraceRay args:
+        // 0: accel, 1: rayFlags, 2: instanceMask, 3: origin, 4: tMin, 5: direction, 6: tMax,
+        // 7: payload
+        auto accel = call->getArg(0);
+        auto rayFlagsArg = call->getArg(1);
+        auto instanceMask = call->getArg(2);
+        auto origin = call->getArg(3);
+        auto tMin = call->getArg(4);
+        auto direction = call->getArg(5);
+        auto tMax = call->getArg(6);
+        auto payloadPtr = call->getArg(7);
+
+        // Insert before the TraceRay call.
+        builder.setInsertBefore(call);
+
+        // Emit MetalRTIntersect instruction.
+        IRInst* intersectArgs[] = {accel, origin, direction, tMin, tMax, rayFlagsArg, instanceMask};
+        auto intersectResult = builder.emitIntrinsicInst(
+            uintType,
+            kIROp_MetalRTIntersect,
+            7,
+            intersectArgs);
+
+        // Emit type check: result type != 0 means we got a hit.
+        auto intersectionType = builder.emitIntrinsicInst(
+            uintType,
+            kIROp_MetalRTIntersectionGetType,
+            1,
+            &intersectResult);
+        auto zero = builder.getIntValue(uintType, 0);
+        auto hitCondition = builder.emitNeq(intersectionType, zero);
+
+        // Create hit/miss/after blocks.
+        // Insert them right after the current block (not at the end of the function)
+        // so that blocks following the current one (e.g. shadow if/else blocks that
+        // reference values computed in afterBlock) remain after afterBlock in the
+        // block list. The MSL emitter processes blocks in list order.
+        auto currentBlock = as<IRBlock>(call->getParent());
+        auto hitBlock = builder.createBlock();
+        auto missBlock = builder.createBlock();
+        auto afterBlock = builder.createBlock();
+        afterBlock->insertAfter(currentBlock);
+        missBlock->insertAfter(currentBlock);
+        hitBlock->insertAfter(currentBlock);
+
+        // Move all instructions after the TraceRay call to afterBlock.
+        {
+            List<IRInst*> instsToMove;
+            for (auto inst = call->getNextInst(); inst; inst = inst->getNextInst())
+            {
+                instsToMove.add(inst);
+            }
+            for (auto inst : instsToMove)
+            {
+                inst->insertAtEnd(afterBlock);
+            }
+        }
+
+        // Emit the if/else branch (replaces the TraceRay call as terminator).
+        builder.emitIfElse(hitCondition, hitBlock, missBlock, afterBlock);
+
+        // Remove the TraceRay call.
+        call->removeAndDeallocate();
+
+        // Hit branch: inline any-hit body for payload modification.
+        inlineShaderBody(
+            entryPoints.anyHit,
+            hitBlock,
+            afterBlock,
+            builder,
+            intersectResult,
+            origin,
+            direction,
+            tMin,
+            tMax,
+            rayFlagsArg,
+            payloadPtr,
+            true);
+
+        // Miss branch: just branch to afterBlock (payload default value is correct).
+        builder.setInsertInto(missBlock);
+        builder.emitBranch(afterBlock);
+    }
+}
+
 static void removeNonRaygenEntryPoints(IRModule* module)
 {
     List<IRInst*> instsToRemove;
@@ -1572,6 +1685,15 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         if (raygenFunc)
         {
             legalizeTraceRayCallsWithVisibleFunctions(raygenFunc, entryPoints, builder);
+        }
+
+        // Lower TraceRay calls inside visible functions (e.g. shadow rays in closestHit)
+        // to intersector calls with inlined any-hit body. Must happen before
+        // legalizeAnyHitFunction which strips payload access from the any-hit.
+        if (entryPoints.closestHit)
+        {
+            legalizeTraceRayCallsInVisibleFunctions(
+                entryPoints.closestHit, entryPoints, builder);
         }
     }
 
