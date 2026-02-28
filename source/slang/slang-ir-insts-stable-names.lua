@@ -743,4 +743,8 @@ return {
 	["MetalRTIntersectionGetInstanceId"] = 741,
 	["MetalRTIntersectionGetBarycentrics"] = 742,
 	["MetalRTIntersectionGetFrontFace"] = 743,
+	["MetalRTIntersectionGetObjectToWorld4x3"] = 744,
+	["MetalRTIntersectionGetObjectToWorld3x4"] = 745,
+	["MetalRTIntersectionGetWorldToObject4x3"] = 746,
+	["MetalRTIntersectionGetWorldToObject3x4"] = 747,
 }

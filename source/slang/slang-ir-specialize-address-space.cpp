@@ -399,7 +399,6 @@ struct AddressSpaceContext : public AddressSpaceSpecializationContext
 
         for (IRFunc* func : functionsToConsiderRemoving)
         {
-            SLANG_ASSERT(!func->findDecoration<IREntryPointDecoration>());
             if (!func->hasUses())
                 func->removeAndDeallocate();
         }

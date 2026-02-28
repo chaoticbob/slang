@@ -42,6 +42,10 @@ enum class MetalRTIntrinsic
     HitKind,
     IgnoreHit,
     AcceptHitAndEndSearch,
+    ObjectToWorld3x4,
+    ObjectToWorld4x3,
+    WorldToObject3x4,
+    WorldToObject4x3,
 };
 
 static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
@@ -80,6 +84,14 @@ static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
             return MetalRTIntrinsic::IgnoreHit;
         if (name == toSlice("AcceptHitAndEndSearch"))
             return MetalRTIntrinsic::AcceptHitAndEndSearch;
+        if (name == toSlice("ObjectToWorld3x4"))
+            return MetalRTIntrinsic::ObjectToWorld3x4;
+        if (name == toSlice("ObjectToWorld4x3"))
+            return MetalRTIntrinsic::ObjectToWorld4x3;
+        if (name == toSlice("WorldToObject3x4"))
+            return MetalRTIntrinsic::WorldToObject3x4;
+        if (name == toSlice("WorldToObject4x3"))
+            return MetalRTIntrinsic::WorldToObject4x3;
     }
     return MetalRTIntrinsic::None;
 }
@@ -215,13 +227,16 @@ static RTEntryPoints findRTEntryPoints(IRModule* module)
             result.raygen = func;
             break;
         case Stage::ClosestHit:
-            result.closestHit = func;
+            if (!result.closestHit)
+                result.closestHit = func;
             break;
         case Stage::Miss:
-            result.miss = func;
+            if (!result.miss)
+                result.miss = func;
             break;
         case Stage::AnyHit:
-            result.anyHit = func;
+            if (!result.anyHit)
+                result.anyHit = func;
             break;
         }
     }
@@ -481,6 +496,46 @@ static void inlineShaderBody(
                             builder.emitIntrinsicInst(uintType, kIROp_Select, 3, selectArgs);
                     }
                     break;
+                case MetalRTIntrinsic::ObjectToWorld4x3:
+                    if (isHitBranch)
+                    {
+                        replacement = builder.emitIntrinsicInst(
+                            call->getDataType(),
+                            kIROp_MetalRTIntersectionGetObjectToWorld4x3,
+                            1,
+                            &intersectResult);
+                    }
+                    break;
+                case MetalRTIntrinsic::ObjectToWorld3x4:
+                    if (isHitBranch)
+                    {
+                        replacement = builder.emitIntrinsicInst(
+                            call->getDataType(),
+                            kIROp_MetalRTIntersectionGetObjectToWorld3x4,
+                            1,
+                            &intersectResult);
+                    }
+                    break;
+                case MetalRTIntrinsic::WorldToObject4x3:
+                    if (isHitBranch)
+                    {
+                        replacement = builder.emitIntrinsicInst(
+                            call->getDataType(),
+                            kIROp_MetalRTIntersectionGetWorldToObject4x3,
+                            1,
+                            &intersectResult);
+                    }
+                    break;
+                case MetalRTIntrinsic::WorldToObject3x4:
+                    if (isHitBranch)
+                    {
+                        replacement = builder.emitIntrinsicInst(
+                            call->getDataType(),
+                            kIROp_MetalRTIntersectionGetWorldToObject3x4,
+                            1,
+                            &intersectResult);
+                    }
+                    break;
                 }
 
                 if (replacement)
@@ -712,18 +767,37 @@ static void legalizeVisibleFunction(
         builder.addNameHintDecoration(payloadParam, toSlice("payload"));
     }
 
+    // Ray parameters (both closesthit and miss).
+    auto float3Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 3);
+    auto floatType = builder.getBasicType(BaseType::Float);
+    auto uintType = builder.getBasicType(BaseType::UInt);
+
+    auto worldRayOriginParam = builder.emitParam(float3Type);
+    builder.addNameHintDecoration(worldRayOriginParam, toSlice("worldRayOrigin"));
+
+    auto worldRayDirectionParam = builder.emitParam(float3Type);
+    builder.addNameHintDecoration(worldRayDirectionParam, toSlice("worldRayDirection"));
+
+    auto rayTMinParam = builder.emitParam(floatType);
+    builder.addNameHintDecoration(rayTMinParam, toSlice("rayTMin"));
+
+    auto rayFlagsParam = builder.emitParam(uintType);
+    builder.addNameHintDecoration(rayFlagsParam, toSlice("rayFlags"));
+
     // Intersection data parameters (closesthit only).
     IRInst* baryParam = nullptr;
     IRInst* distParam = nullptr;
     IRInst* primIdParam = nullptr;
     IRInst* instIdParam = nullptr;
     IRInst* frontFacingParam = nullptr;
+    IRInst* objectToWorld4x3Param = nullptr;
+    IRInst* objectToWorld3x4Param = nullptr;
+    IRInst* worldToObject4x3Param = nullptr;
+    IRInst* worldToObject3x4Param = nullptr;
 
     if (isClosestHit)
     {
         auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
-        auto floatType = builder.getBasicType(BaseType::Float);
-        auto uintType = builder.getBasicType(BaseType::UInt);
         auto boolType = builder.getBoolType();
 
         baryParam = builder.emitParam(float2Type);
@@ -740,6 +814,26 @@ static void legalizeVisibleFunction(
 
         frontFacingParam = builder.emitParam(boolType);
         builder.addNameHintDecoration(frontFacingParam, toSlice("frontFacing"));
+
+        // Transform matrix parameters.
+        auto intType = builder.getIntType();
+        auto intVal4 = builder.getIntValue(intType, 4);
+        auto intVal3 = builder.getIntValue(intType, 3);
+        auto noLayout = builder.getIntValue(intType, 0);
+        auto float4x3Type = builder.getMatrixType(floatType, intVal4, intVal3, noLayout);
+        auto float3x4Type = builder.getMatrixType(floatType, intVal3, intVal4, noLayout);
+
+        objectToWorld4x3Param = builder.emitParam(float4x3Type);
+        builder.addNameHintDecoration(objectToWorld4x3Param, toSlice("objectToWorld4x3"));
+
+        objectToWorld3x4Param = builder.emitParam(float3x4Type);
+        builder.addNameHintDecoration(objectToWorld3x4Param, toSlice("objectToWorld3x4"));
+
+        worldToObject4x3Param = builder.emitParam(float4x3Type);
+        builder.addNameHintDecoration(worldToObject4x3Param, toSlice("worldToObject4x3"));
+
+        worldToObject3x4Param = builder.emitParam(float3x4Type);
+        builder.addNameHintDecoration(worldToObject3x4Param, toSlice("worldToObject3x4"));
     }
 
     // Replace entryPointParams load results with new parameter values.
@@ -805,6 +899,33 @@ static void legalizeVisibleFunction(
                 {
                 }
                 break;
+            case MetalRTIntrinsic::TraceRay:
+                {
+                    // TraceRay calls inside visible functions can't be handled yet
+                    // (requires multiple miss/closesthit dispatch). Remove them for now.
+                    intrinsicCallsToRemove.add(call);
+                    continue;
+                }
+            case MetalRTIntrinsic::WorldRayOrigin:
+                {
+                    replacement = worldRayOriginParam;
+                }
+                break;
+            case MetalRTIntrinsic::WorldRayDirection:
+                {
+                    replacement = worldRayDirectionParam;
+                }
+                break;
+            case MetalRTIntrinsic::RayTMin:
+                {
+                    replacement = rayTMinParam;
+                }
+                break;
+            case MetalRTIntrinsic::RayFlags:
+                {
+                    replacement = rayFlagsParam;
+                }
+                break;
             case MetalRTIntrinsic::RayTCurrent:
                 {
                     if (isClosestHit && distParam)
@@ -841,6 +962,38 @@ static void legalizeVisibleFunction(
                         IRInst* selectArgs[] = {frontFacingParam, frontVal, backVal};
                         replacement =
                             builder.emitIntrinsicInst(uintType, kIROp_Select, 3, selectArgs);
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::ObjectToWorld4x3:
+                {
+                    if (isClosestHit && objectToWorld4x3Param)
+                    {
+                        replacement = objectToWorld4x3Param;
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::ObjectToWorld3x4:
+                {
+                    if (isClosestHit && objectToWorld3x4Param)
+                    {
+                        replacement = objectToWorld3x4Param;
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::WorldToObject4x3:
+                {
+                    if (isClosestHit && worldToObject4x3Param)
+                    {
+                        replacement = worldToObject4x3Param;
+                    }
+                }
+                break;
+            case MetalRTIntrinsic::WorldToObject3x4:
+                {
+                    if (isClosestHit && worldToObject3x4Param)
+                    {
+                        replacement = worldToObject3x4Param;
                     }
                 }
                 break;
@@ -985,8 +1138,22 @@ static void legalizeAnyHitFunction(
         if (rep.isPayload)
         {
             // Payload access not supported in Metal intersection functions.
-            // Remove all uses — they'll become dead code.
-            rep.load->replaceUsesWith(nullptr);
+            // Remove the payload usage chain (field addresses, stores, loads).
+            List<IRInst*> payloadInstsToRemove;
+            for (auto use = rep.load->firstUse; use; use = use->nextUse)
+            {
+                auto user = use->getUser();
+                // Collect transitive users (e.g., stores through field addresses).
+                for (auto innerUse = user->firstUse; innerUse; innerUse = innerUse->nextUse)
+                {
+                    payloadInstsToRemove.add(innerUse->getUser());
+                }
+                payloadInstsToRemove.add(user);
+            }
+            for (auto inst : payloadInstsToRemove)
+            {
+                inst->removeAndDeallocate();
+            }
         }
         else if (rep.isAttrs && baryParam)
         {
@@ -1177,11 +1344,7 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
         auto tMax = call->getArg(6);
         auto payloadPtr = call->getArg(7);
 
-        SLANG_UNUSED(origin);
-        SLANG_UNUSED(direction);
-        SLANG_UNUSED(tMin);
         SLANG_UNUSED(tMax);
-        SLANG_UNUSED(rayFlagsArg);
 
         // Insert before the TraceRay call.
         builder.setInsertBefore(call);
@@ -1264,20 +1427,51 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
                 1,
                 &intersectResult);
 
+            // Transform matrix data.
+            auto intType = builder.getIntType();
+            auto intVal4 = builder.getIntValue(intType, 4);
+            auto intVal3 = builder.getIntValue(intType, 3);
+            auto noLayout = builder.getIntValue(intType, 0);
+            auto float4x3Type = builder.getMatrixType(floatType, intVal4, intVal3, noLayout);
+            auto float3x4Type = builder.getMatrixType(floatType, intVal3, intVal4, noLayout);
+
+            auto objectToWorld4x3 = builder.emitIntrinsicInst(
+                float4x3Type,
+                kIROp_MetalRTIntersectionGetObjectToWorld4x3,
+                1,
+                &intersectResult);
+            auto objectToWorld3x4 = builder.emitIntrinsicInst(
+                float3x4Type,
+                kIROp_MetalRTIntersectionGetObjectToWorld3x4,
+                1,
+                &intersectResult);
+            auto worldToObject4x3 = builder.emitIntrinsicInst(
+                float4x3Type,
+                kIROp_MetalRTIntersectionGetWorldToObject4x3,
+                1,
+                &intersectResult);
+            auto worldToObject3x4 = builder.emitIntrinsicInst(
+                float3x4Type,
+                kIROp_MetalRTIntersectionGetWorldToObject3x4,
+                1,
+                &intersectResult);
+
             IRInst* hitArgs[] = {
-                payloadPtr, barycentrics, distance, primitiveId, instanceId, frontFacing};
+                payloadPtr, origin, direction, tMin, rayFlagsArg,
+                barycentrics, distance, primitiveId, instanceId, frontFacing,
+                objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4};
             builder.emitCallInst(
-                builder.getVoidType(), entryPoints.closestHit, 6, hitArgs);
+                builder.getVoidType(), entryPoints.closestHit, 14, hitArgs);
         }
         builder.emitBranch(afterBlock);
 
-        // Miss branch: call missFunc with payload pointer only.
+        // Miss branch: call missFunc with payload pointer and ray params.
         builder.setInsertInto(missBlock);
         if (entryPoints.miss)
         {
-            IRInst* missArgs[] = {payloadPtr};
+            IRInst* missArgs[] = {payloadPtr, origin, direction, tMin, rayFlagsArg};
             builder.emitCallInst(
-                builder.getVoidType(), entryPoints.miss, 1, missArgs);
+                builder.getVoidType(), entryPoints.miss, 5, missArgs);
         }
         builder.emitBranch(afterBlock);
     }

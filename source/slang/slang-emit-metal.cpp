@@ -1262,6 +1262,12 @@ void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
                 m_writer->emit(" object_data");
                 m_writer->emit("*");
                 break;
+            case AddressSpace::Generic:
+                // Generic address space can appear in RT entryPointParams struct types.
+                // Map to device for Metal.
+                m_writer->emit(" device");
+                m_writer->emit("*");
+                break;
             default:
                 SLANG_UNEXPECTED("Unknown addressspace encountered.");
                 break;

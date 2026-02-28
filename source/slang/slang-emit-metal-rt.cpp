@@ -28,7 +28,7 @@ void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
         break;
     case Stage::AnyHit:
         {
-            m_writer->emit("[[intersection(triangle, instancing)]] ");
+            m_writer->emit("[[intersection(triangle, triangle_data, instancing)]] ");
         }
         break;
     default:
@@ -81,8 +81,8 @@ bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
             int idx = m_intersectorCounter++;
             auto resultName = getName(inst);
 
-            // Emit: intersector<triangle_data, instancing> _i_N;
-            m_writer->emit("intersector<triangle_data, instancing> _i_");
+            // Emit: intersector<triangle_data, instancing, world_space_data> _i_N;
+            m_writer->emit("intersector<triangle_data, instancing, world_space_data> _i_");
             m_writer->emit(idx);
             m_writer->emit(";\n");
 
@@ -203,6 +203,40 @@ bool MetalRTSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& i
             emitOperand(inst->getOperand(0), leftSide(outerPrec, prec));
             m_writer->emit(".triangle_front_facing");
             maybeCloseParens(needClose);
+            return true;
+        }
+    case kIROp_MetalRTIntersectionGetObjectToWorld4x3:
+        {
+            EmitOpInfo outerPrec = inOuterPrec;
+            auto prec = getInfo(EmitOp::Postfix);
+            bool needClose = maybeEmitParens(outerPrec, prec);
+            emitOperand(inst->getOperand(0), leftSide(outerPrec, prec));
+            m_writer->emit(".object_to_world_transform");
+            maybeCloseParens(needClose);
+            return true;
+        }
+    case kIROp_MetalRTIntersectionGetObjectToWorld3x4:
+        {
+            m_writer->emit("transpose(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            m_writer->emit(".object_to_world_transform)");
+            return true;
+        }
+    case kIROp_MetalRTIntersectionGetWorldToObject4x3:
+        {
+            EmitOpInfo outerPrec = inOuterPrec;
+            auto prec = getInfo(EmitOp::Postfix);
+            bool needClose = maybeEmitParens(outerPrec, prec);
+            emitOperand(inst->getOperand(0), leftSide(outerPrec, prec));
+            m_writer->emit(".world_to_object_transform");
+            maybeCloseParens(needClose);
+            return true;
+        }
+    case kIROp_MetalRTIntersectionGetWorldToObject3x4:
+        {
+            m_writer->emit("transpose(");
+            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+            m_writer->emit(".world_to_object_transform)");
             return true;
         }
     default:

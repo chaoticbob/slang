@@ -19802,7 +19802,7 @@ float3 ObjectRayDirection()
 /// @remarks Includes position and orientation of the current instance
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 float3x4 ObjectToWorld3x4()
 {
     __target_switch
@@ -19810,6 +19810,7 @@ float3x4 ObjectToWorld3x4()
     case hlsl:  __intrinsic_asm "ObjectToWorld3x4";
     case glsl: __intrinsic_asm "transpose(gl_ObjectToWorldEXT)";
     case cuda: __intrinsic_asm "slangOptixGetObjectToWorldTransformMatrix";
+    case metal: __intrinsic_asm "(_metalrt_ObjectToWorld3x4)";
     case spirv:
         return spirv_asm
         {
@@ -19824,7 +19825,7 @@ float3x4 ObjectToWorld3x4()
 /// @remarks Inverse of the object-to-world transform
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 float3x4 WorldToObject3x4()
 {
     __target_switch
@@ -19832,6 +19833,7 @@ float3x4 WorldToObject3x4()
     case hlsl:  __intrinsic_asm "WorldToObject3x4";
     case glsl: __intrinsic_asm "transpose(gl_WorldToObjectEXT)";
     case cuda: __intrinsic_asm "slangOptixGetWorldToObjectTransformMatrix";
+    case metal: __intrinsic_asm "(_metalrt_WorldToObject3x4)";
     case spirv:
         return spirv_asm
         {
@@ -19846,7 +19848,7 @@ float3x4 WorldToObject3x4()
 /// @remarks Transposed version of ObjectToWorld3x4
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 float4x3 ObjectToWorld4x3()
 {
     __target_switch
@@ -19854,6 +19856,7 @@ float4x3 ObjectToWorld4x3()
     case hlsl:  __intrinsic_asm "ObjectToWorld4x3";
     case glsl: __intrinsic_asm "(gl_ObjectToWorldEXT)";
     case cuda: __intrinsic_asm "slangOptixGetObjectToWorldTransformMatrix4x3";
+    case metal: __intrinsic_asm "(_metalrt_ObjectToWorld4x3)";
     case spirv:
         return spirv_asm
         {
@@ -19867,7 +19870,7 @@ float4x3 ObjectToWorld4x3()
 /// @remarks Transposed version of WorldToObject3x4
 /// @category raytracing
 [NonUniformReturn]
-[require(cuda_glsl_hlsl_spirv, raytracing_anyhit_closesthit_intersection)]
+[require(cuda_glsl_hlsl_metal_spirv, raytracing_anyhit_closesthit_intersection)]
 float4x3 WorldToObject4x3()
 {
     __target_switch
@@ -19875,6 +19878,7 @@ float4x3 WorldToObject4x3()
     case hlsl:  __intrinsic_asm "WorldToObject4x3";
     case glsl: __intrinsic_asm "(gl_WorldToObjectEXT)";
     case cuda: __intrinsic_asm "slangOptixGetWorldToObjectTransformMatrix4x3";
+    case metal: __intrinsic_asm "(_metalrt_WorldToObject4x3)";
     case spirv:
         return spirv_asm
         {
