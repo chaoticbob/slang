@@ -28,7 +28,7 @@ void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
         break;
     case Stage::AnyHit:
         {
-            m_writer->emit("[[intersection(triangle, triangle_data, instancing)]] ");
+            m_writer->emit("[[intersection(triangle, triangle_data, instancing, world_space_data)]] ");
         }
         break;
     default:
@@ -41,9 +41,33 @@ void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
 
 void MetalRTSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
 {
-    // Check if this is a _metalrt_* param with a buffer binding.
+    // Check if this is a _metalrt_* param with special handling.
     if (auto nameHint = param->findDecoration<IRNameHintDecoration>())
     {
+        if (nameHint->getName() == toSlice("_metalrt_func_table"))
+        {
+            // Emit: intersection_function_table<triangle_data, instancing, world_space_data> name
+            m_writer->emit("intersection_function_table<triangle_data, instancing, world_space_data> ");
+            m_writer->emit(getName(param));
+            if (auto sysVal = param->findDecoration<IRTargetSystemValueDecoration>())
+            {
+                m_writer->emit(" [[");
+                m_writer->emit(sysVal->getSemantic());
+                m_writer->emit("]]");
+            }
+            return;
+        }
+        if (nameHint->getName() == toSlice("_metalrt_payload"))
+        {
+            // Emit: ray_data PayloadType& name [[payload]]
+            auto ptrType = as<IRPtrTypeBase>(param->getDataType());
+            m_writer->emit("ray_data ");
+            emitSimpleType(ptrType->getValueType());
+            m_writer->emit("& ");
+            m_writer->emit(getName(param));
+            m_writer->emit(" [[payload]]");
+            return;
+        }
         if (nameHint->getName().startsWith(toSlice("_metalrt_")))
         {
             if (auto sysVal = param->findDecoration<IRTargetSystemValueDecoration>())
@@ -72,6 +96,23 @@ void MetalRTSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
     }
 }
 
+void MetalRTSourceEmitter::_emitStoreImpl(IRStore* store)
+{
+    // ray_data T* in the IR is emitted as ray_data T& (reference) in MSL.
+    // Storing to a reference is just ref = value (no * dereference).
+    auto dstPtr = store->getPtr();
+    auto ptrType = as<IRPtrTypeBase>(dstPtr->getDataType());
+    if (ptrType && ptrType->getAddressSpace() == AddressSpace::MetalRayData)
+    {
+        emitOperand(dstPtr, getInfo(EmitOp::General));
+        m_writer->emit(" = ");
+        emitOperand(store->getVal(), getInfo(EmitOp::General));
+        m_writer->emit(";\n");
+        return;
+    }
+    Super::_emitStoreImpl(store);
+}
+
 bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
 {
     switch (inst->getOp())
@@ -81,7 +122,7 @@ bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
             int idx = m_intersectorCounter++;
             auto resultName = getName(inst);
 
-            // Emit: intersector<triangle_data, instancing, world_space_data> _i_N;
+            // Emit intersector template.
             m_writer->emit("intersector<triangle_data, instancing, world_space_data> _i_");
             m_writer->emit(idx);
             m_writer->emit(";\n");
@@ -119,18 +160,85 @@ bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
             emitOperand(inst->getOperand(4), getInfo(EmitOp::General));
             m_writer->emit(";\n");
 
-            // auto <result> = _i_N.intersect(_r_N, <accel>, <mask>);
-            m_writer->emit("auto ");
-            m_writer->emit(resultName);
-            m_writer->emit(" = _i_");
-            m_writer->emit(idx);
-            m_writer->emit(".intersect(_r_");
-            m_writer->emit(idx);
-            m_writer->emit(", ");
-            emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
-            m_writer->emit(", ");
-            emitOperand(inst->getOperand(6), getInfo(EmitOp::General));
-            m_writer->emit(");\n");
+            // Configure intersector from HLSL ray flags (operand 5).
+            // RAY_FLAG_FORCE_OPAQUE = 0x01, RAY_FLAG_FORCE_NON_OPAQUE = 0x02,
+            // RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH = 0x04
+            {
+                auto rayFlags = inst->getOperand(5);
+                bool hasIFT = inst->getOperandCount() >= 9;
+
+                m_writer->emit("if (");
+                emitOperand(rayFlags, getInfo(EmitOp::General));
+                m_writer->emit(" & 0x01u) _i_");
+                m_writer->emit(idx);
+                m_writer->emit(".force_opacity(forced_opacity::opaque);\n");
+
+                m_writer->emit("if (");
+                emitOperand(rayFlags, getInfo(EmitOp::General));
+                m_writer->emit(" & 0x02u) _i_");
+                m_writer->emit(idx);
+                m_writer->emit(".force_opacity(forced_opacity::non_opaque);\n");
+
+                // Metal's accept_any_intersection(true) skips intersection functions
+                // entirely. In DXR, RAY_FLAG_ACCEPT_FIRST_HIT still runs any-hit
+                // shaders before accepting. When an intersection function table is
+                // present, only enable accept_any_intersection when FORCE_NON_OPAQUE
+                // is not set, so that intersection functions are still called for
+                // non-opaque geometry.
+                if (hasIFT)
+                {
+                    m_writer->emit("if ((");
+                    emitOperand(rayFlags, getInfo(EmitOp::General));
+                    m_writer->emit(" & 0x04u) && !(");
+                    emitOperand(rayFlags, getInfo(EmitOp::General));
+                    m_writer->emit(" & 0x02u)) _i_");
+                    m_writer->emit(idx);
+                    m_writer->emit(".accept_any_intersection(true);\n");
+                }
+                else
+                {
+                    m_writer->emit("if (");
+                    emitOperand(rayFlags, getInfo(EmitOp::General));
+                    m_writer->emit(" & 0x04u) _i_");
+                    m_writer->emit(idx);
+                    m_writer->emit(".accept_any_intersection(true);\n");
+                }
+            }
+
+            // 7-operand: intersect(ray, accel, mask)
+            // 9-operand: intersect(ray, accel, mask, funcTable, *payload)
+            if (inst->getOperandCount() >= 9)
+            {
+                m_writer->emit("auto ");
+                m_writer->emit(resultName);
+                m_writer->emit(" = _i_");
+                m_writer->emit(idx);
+                m_writer->emit(".intersect(_r_");
+                m_writer->emit(idx);
+                m_writer->emit(", ");
+                emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+                m_writer->emit(", ");
+                emitOperand(inst->getOperand(6), getInfo(EmitOp::General));
+                m_writer->emit(", ");
+                emitOperand(inst->getOperand(7), getInfo(EmitOp::General));
+                m_writer->emit(", *");
+                emitOperand(inst->getOperand(8), getInfo(EmitOp::General));
+                m_writer->emit(");\n");
+            }
+            else
+            {
+                m_writer->emit("auto ");
+                m_writer->emit(resultName);
+                m_writer->emit(" = _i_");
+                m_writer->emit(idx);
+                m_writer->emit(".intersect(_r_");
+                m_writer->emit(idx);
+                m_writer->emit(", ");
+                emitOperand(inst->getOperand(0), getInfo(EmitOp::General));
+                m_writer->emit(", ");
+                emitOperand(inst->getOperand(6), getInfo(EmitOp::General));
+                m_writer->emit(");\n");
+            }
             return true;
         }
     default:
@@ -144,6 +252,19 @@ bool MetalRTSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& i
 {
     switch (inst->getOp())
     {
+    case kIROp_Load:
+        {
+            // ray_data T* in the IR is emitted as ray_data T& (reference) in MSL.
+            // Loading from a reference is just the reference itself (no * dereference).
+            auto base = inst->getOperand(0);
+            auto basePtrType = as<IRPtrTypeBase>(base->getDataType());
+            if (basePtrType && basePtrType->getAddressSpace() == AddressSpace::MetalRayData)
+            {
+                emitOperand(base, inOuterPrec);
+                return true;
+            }
+            break;
+        }
     case kIROp_MetalRTIntersectionGetType:
         {
             EmitOpInfo outerPrec = inOuterPrec;

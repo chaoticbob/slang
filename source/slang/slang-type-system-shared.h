@@ -73,6 +73,8 @@ enum class AddressSpace : uint64_t
     Uniform,
     // specific address space for payload data in metal
     MetalObjectData,
+    // specific address space for ray_data payload in Metal ray tracing
+    MetalRayData,
     // Corresponds to SPIR-V's SpvStorageClassInput
     Input,
     // Same as `Input`, but used for builtin input variables.

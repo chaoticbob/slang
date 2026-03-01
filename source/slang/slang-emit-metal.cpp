@@ -1262,6 +1262,10 @@ void MetalSourceEmitter::emitSimpleTypeImpl(IRType* type)
                 m_writer->emit(" object_data");
                 m_writer->emit("*");
                 break;
+            case AddressSpace::MetalRayData:
+                m_writer->emit(" ray_data");
+                m_writer->emit("*");
+                break;
             case AddressSpace::Generic:
                 // Generic address space can appear in RT entryPointParams struct types.
                 // Map to device for Metal.
@@ -1657,6 +1661,9 @@ void MetalSourceEmitter::emitRateQualifiersAndAddressSpaceImpl(
         break;
     case AddressSpace::MetalObjectData:
         m_writer->emit("object_data ");
+        break;
+    case AddressSpace::MetalRayData:
+        m_writer->emit("ray_data ");
         break;
     default:
         break;

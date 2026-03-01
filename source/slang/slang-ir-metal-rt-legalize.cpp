@@ -96,11 +96,11 @@ static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
     return MetalRTIntrinsic::None;
 }
 
-static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispatchDimsBufferSlot)
+static IRInst* legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispatchDimsBufferSlot)
 {
     auto firstBlock = func->getFirstBlock();
     if (!firstBlock)
-        return;
+        return nullptr;
 
     // Build uint3 type.
     auto uintType = builder.getBasicType(BaseType::UInt);
@@ -119,7 +119,12 @@ static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispa
     bufferSlotStr << "buffer(" << dispatchDimsBufferSlot << ")";
     builder.addTargetSystemValueDecoration(dimsParam, bufferSlotStr.getUnownedSlice());
 
-    // 3. Replace intrinsic calls with the new parameters.
+    // 3. Add intersection function table parameter at [[buffer(29)]].
+    auto funcTableParam = builder.emitParam(uintType);
+    builder.addNameHintDecoration(funcTableParam, toSlice("_metalrt_func_table"));
+    builder.addTargetSystemValueDecoration(funcTableParam, toSlice("buffer(29)"));
+
+    // 4. Replace intrinsic calls with the new parameters.
     List<IRCall*> callsToRemove;
     for (auto block : func->getBlocks())
     {
@@ -159,7 +164,7 @@ static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispa
         call->removeAndDeallocate();
     }
 
-    // 4. Change stage from RayGeneration to Compute.
+    // 5. Change stage from RayGeneration to Compute.
     if (auto entryPointDecor = func->findDecoration<IREntryPointDecoration>())
     {
         auto profile = entryPointDecor->getProfile();
@@ -169,7 +174,7 @@ static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispa
             builder.getIntValue(builder.getIntType(), profile.raw));
     }
 
-    // 5. Add [numthreads(8, 8, 1)] decoration.
+    // 6. Add [numthreads(8, 8, 1)] decoration.
     auto intType = builder.getIntType();
     builder.addNumThreadsDecoration(
         func,
@@ -177,8 +182,10 @@ static void legalizeRaygenEntryPoint(IRFunc* func, IRBuilder& builder, int dispa
         builder.getIntValue(intType, 8),
         builder.getIntValue(intType, 1));
 
-    // 6. Fix up the function type to match the new parameter list.
+    // 7. Fix up the function type to match the new parameter list.
     fixUpFuncType(func);
+
+    return funcTableParam;
 }
 
 struct RTEntryPoints
@@ -187,6 +194,7 @@ struct RTEntryPoints
     IRFunc* closestHit = nullptr;
     IRFunc* miss = nullptr;
     IRFunc* anyHit = nullptr;
+    IRInst* raygenFuncTable = nullptr;
 };
 
 // Check if a struct type has the name "BuiltInTriangleIntersectionAttributes".
@@ -834,6 +842,10 @@ static void legalizeVisibleFunction(
 
         worldToObject3x4Param = builder.emitParam(float3x4Type);
         builder.addNameHintDecoration(worldToObject3x4Param, toSlice("worldToObject3x4"));
+
+        // Intersection function table parameter (passed from raygen).
+        auto funcTableParam = builder.emitParam(uintType);
+        builder.addNameHintDecoration(funcTableParam, toSlice("_metalrt_func_table"));
     }
 
     // Replace entryPointParams load results with new parameter values.
@@ -1136,22 +1148,48 @@ static void legalizeAnyHitFunction(
     {
         if (rep.isPayload)
         {
-            // Payload access not supported in Metal intersection functions.
-            // Remove the payload usage chain (field addresses, stores, loads).
-            List<IRInst*> payloadInstsToRemove;
-            for (auto use = rep.load->firstUse; use; use = use->nextUse)
+            // Create ray_data payload parameter with [[payload]] attribute.
+            // The payload type is extracted from BorrowInOutParam -> underlying struct type.
+            // In MSL, the payload param is a reference (ray_data T&), not a pointer.
+            // The existing IR code accesses payload through pointer ops (get_field_addr -> store).
+            // To bridge the reference/pointer mismatch:
+            //   1. Create the ray_data param (emitted as ray_data T& [[payload]])
+            //   2. Allocate a thread-local copy and load the param into it
+            //   3. Replace rep.load with &localCopy (thread T* — pointer ops work)
+            //   4. At every return, write localCopy back to the ray_data param
+            auto payloadPtrType = cast<IRPtrTypeBase>(rep.load->getDataType());
+            auto payloadStructType = payloadPtrType->getValueType();
+            auto rayDataPtrType = builder.getPtrType(payloadStructType, AddressSpace::MetalRayData);
+            auto payloadParam = builder.emitParam(rayDataPtrType);
+            builder.addNameHintDecoration(payloadParam, toSlice("_metalrt_payload"));
+            builder.addTargetSystemValueDecoration(payloadParam, toSlice("payload"));
+
+            // Allocate thread-local copy and load from ray_data param.
+            auto insertPoint = firstBlock->getFirstOrdinaryInst();
+            if (insertPoint)
+                builder.setInsertBefore(insertPoint);
+            else
+                builder.setInsertInto(firstBlock);
+
+            auto localVar = builder.emitVar(payloadStructType);
+            auto payloadVal = builder.emitLoad(payloadStructType, payloadParam);
+            builder.emitStore(localVar, payloadVal);
+
+            // Replace payload pointer uses with address of local copy.
+            rep.load->replaceUsesWith(localVar);
+
+            // Before every return, write the local copy back to the ray_data param.
+            for (auto block : func->getBlocks())
             {
-                auto user = use->getUser();
-                // Collect transitive users (e.g., stores through field addresses).
-                for (auto innerUse = user->firstUse; innerUse; innerUse = innerUse->nextUse)
+                for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
                 {
-                    payloadInstsToRemove.add(innerUse->getUser());
+                    if (as<IRReturn>(inst))
+                    {
+                        builder.setInsertBefore(inst);
+                        auto updatedVal = builder.emitLoad(payloadStructType, localVar);
+                        builder.emitStore(payloadParam, updatedVal);
+                    }
                 }
-                payloadInstsToRemove.add(user);
-            }
-            for (auto inst : payloadInstsToRemove)
-            {
-                inst->removeAndDeallocate();
             }
         }
         else if (rep.isAttrs && baryParam)
@@ -1458,9 +1496,10 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
             IRInst* hitArgs[] = {
                 payloadPtr, origin, direction, tMin, rayFlagsArg,
                 barycentrics, distance, primitiveId, instanceId, frontFacing,
-                objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4};
+                objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
+                entryPoints.raygenFuncTable};
             builder.emitCallInst(
-                builder.getVoidType(), entryPoints.closestHit, 14, hitArgs);
+                builder.getVoidType(), entryPoints.closestHit, 15, hitArgs);
         }
         builder.emitBranch(afterBlock);
 
@@ -1476,13 +1515,11 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
     }
 }
 
-// Lower TraceRay calls inside visible functions (e.g. closestHit) to intersector calls,
-// inlining the any-hit body into the hit branch for payload modification.
-// Must be called BEFORE legalizeAnyHitFunction transforms the any-hit into an
-// [[intersection]] function (which strips payload access).
+// Lower TraceRay calls inside visible functions (e.g. closestHit) to
+// MetalRTIntersect calls that pass the intersection function table and payload.
+// The any-hit function runs automatically during intersect() via the function table.
 static void legalizeTraceRayCallsInVisibleFunctions(
     IRFunc* visibleFunc,
-    const RTEntryPoints& entryPoints,
     IRBuilder& builder)
 {
     // Find all TraceRay calls in the visible function.
@@ -1497,6 +1534,20 @@ static void legalizeTraceRayCallsInVisibleFunctions(
             if (getMetalRTIntrinsicFromCall(call) == MetalRTIntrinsic::TraceRay)
             {
                 traceRayCalls.add(call);
+            }
+        }
+    }
+
+    // Find the function table parameter by scanning for _metalrt_func_table name hint.
+    IRInst* funcTableParam = nullptr;
+    for (auto param : visibleFunc->getFirstBlock()->getParams())
+    {
+        if (auto hint = param->findDecoration<IRNameHintDecoration>())
+        {
+            if (hint->getName() == toSlice("_metalrt_func_table"))
+            {
+                funcTableParam = param;
+                break;
             }
         }
     }
@@ -1517,76 +1568,18 @@ static void legalizeTraceRayCallsInVisibleFunctions(
         auto tMax = call->getArg(6);
         auto payloadPtr = call->getArg(7);
 
-        // Insert before the TraceRay call.
         builder.setInsertBefore(call);
 
-        // Emit MetalRTIntersect instruction.
-        IRInst* intersectArgs[] = {accel, origin, direction, tMin, tMax, rayFlagsArg, instanceMask};
-        auto intersectResult = builder.emitIntrinsicInst(
-            uintType,
-            kIROp_MetalRTIntersect,
-            7,
-            intersectArgs);
+        // 9-operand MetalRTIntersect: accel, origin, direction, tMin, tMax,
+        //   rayFlags, instanceMask, funcTable, payloadPtr
+        IRInst* intersectArgs[] = {
+            accel, origin, direction, tMin, tMax,
+            rayFlagsArg, instanceMask, funcTableParam, payloadPtr};
+        builder.emitIntrinsicInst(uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
 
-        // Emit type check: result type != 0 means we got a hit.
-        auto intersectionType = builder.emitIntrinsicInst(
-            uintType,
-            kIROp_MetalRTIntersectionGetType,
-            1,
-            &intersectResult);
-        auto zero = builder.getIntValue(uintType, 0);
-        auto hitCondition = builder.emitNeq(intersectionType, zero);
-
-        // Create hit/miss/after blocks.
-        // Insert them right after the current block (not at the end of the function)
-        // so that blocks following the current one (e.g. shadow if/else blocks that
-        // reference values computed in afterBlock) remain after afterBlock in the
-        // block list. The MSL emitter processes blocks in list order.
-        auto currentBlock = as<IRBlock>(call->getParent());
-        auto hitBlock = builder.createBlock();
-        auto missBlock = builder.createBlock();
-        auto afterBlock = builder.createBlock();
-        afterBlock->insertAfter(currentBlock);
-        missBlock->insertAfter(currentBlock);
-        hitBlock->insertAfter(currentBlock);
-
-        // Move all instructions after the TraceRay call to afterBlock.
-        {
-            List<IRInst*> instsToMove;
-            for (auto inst = call->getNextInst(); inst; inst = inst->getNextInst())
-            {
-                instsToMove.add(inst);
-            }
-            for (auto inst : instsToMove)
-            {
-                inst->insertAtEnd(afterBlock);
-            }
-        }
-
-        // Emit the if/else branch (replaces the TraceRay call as terminator).
-        builder.emitIfElse(hitCondition, hitBlock, missBlock, afterBlock);
-
-        // Remove the TraceRay call.
+        // Just remove the TraceRay — no block splitting needed.
+        // The any-hit ran during intersect() and modified the payload.
         call->removeAndDeallocate();
-
-        // Hit branch: inline any-hit body for payload modification.
-        inlineShaderBody(
-            entryPoints.anyHit,
-            hitBlock,
-            afterBlock,
-            builder,
-            intersectResult,
-            origin,
-            direction,
-            tMin,
-            tMax,
-            rayFlagsArg,
-            payloadPtr,
-            true);
-
-        // Miss branch: just branch to afterBlock (payload default value is correct).
-        builder.setInsertInto(missBlock);
-        builder.emitBranch(afterBlock);
     }
 }
 
@@ -1665,7 +1658,7 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
             continue;
         }
 
-        legalizeRaygenEntryPoint(func, builder, dispatchDimsBufferSlot);
+        entryPoints.raygenFuncTable = legalizeRaygenEntryPoint(func, builder, dispatchDimsBufferSlot);
         raygenFunc = func;
     }
 
@@ -1688,12 +1681,10 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         }
 
         // Lower TraceRay calls inside visible functions (e.g. shadow rays in closestHit)
-        // to intersector calls with inlined any-hit body. Must happen before
-        // legalizeAnyHitFunction which strips payload access from the any-hit.
+        // to MetalRTIntersect calls with intersection function table and payload.
         if (entryPoints.closestHit)
         {
-            legalizeTraceRayCallsInVisibleFunctions(
-                entryPoints.closestHit, entryPoints, builder);
+            legalizeTraceRayCallsInVisibleFunctions(entryPoints.closestHit, builder);
         }
     }
 
