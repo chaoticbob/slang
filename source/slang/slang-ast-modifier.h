@@ -1949,6 +1949,12 @@ class NonCopyableTypeAttribute : public Attribute
 };
 
 FIDDLE()
+class MetalPackedAttribute : public Attribute
+{
+    FIDDLE(...)
+};
+
+FIDDLE()
 class NoSideEffectAttribute : public Attribute
 {
     FIDDLE(...)

@@ -10349,6 +10349,8 @@ struct DeclLoweringVisitor : DeclVisitor<DeclLoweringVisitor, LoweredValInfo>
         {
             if (as<NonCopyableTypeAttribute>(modifier))
                 subBuilder->addNonCopyableTypeDecoration(irAggType);
+            else if (as<MetalPackedAttribute>(modifier))
+                subBuilder->addMetalPackedDecoration(irAggType);
             else if (as<AutoDiffBuiltinAttribute>(modifier))
                 subBuilder->addAutoDiffBuiltinDecoration(irAggType);
         }

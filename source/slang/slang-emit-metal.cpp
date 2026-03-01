@@ -1002,6 +1002,28 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
             m_writer->emit("nullptr");
             return true;
         }
+    case kIROp_FieldExtract:
+        {
+            auto fieldExtract = as<IRFieldExtract>(inst);
+            auto baseType = fieldExtract->getBase()->getDataType();
+            if (auto structType = as<IRStructType>(baseType))
+            {
+                if (structType->findDecoration<IRMetalPackedDecoration>() &&
+                    inst->getDataType()->getOp() == kIROp_VectorType)
+                {
+                    // Wrap packed vector field access in a cast to the regular vector type
+                    // so it can be used in arithmetic/matrix operations.
+                    emitType(inst->getDataType());
+                    m_writer->emit("(");
+                    emitOperand(fieldExtract->getBase(), getInfo(EmitOp::General));
+                    m_writer->emit(".");
+                    m_writer->emit(getName(fieldExtract->getField()));
+                    m_writer->emit(")");
+                    return true;
+                }
+            }
+            break;
+        }
     default:
         break;
     }
@@ -1011,6 +1033,9 @@ bool MetalSourceEmitter::tryEmitInstExprImpl(IRInst* inst, const EmitOpInfo& inO
 
 void MetalSourceEmitter::emitVectorTypeNameImpl(IRType* elementType, IRIntegerValue elementCount)
 {
+    if (m_emitPackedVectors && elementCount > 1)
+        m_writer->emit("packed_");
+
     emitSimpleTypeImpl(elementType);
 
     switch (elementType->getOp())
@@ -1703,6 +1728,18 @@ void MetalSourceEmitter::emitFrontMatterImpl(TargetRequest*)
 
 void MetalSourceEmitter::emitGlobalInstImpl(IRInst* inst)
 {
+    if (inst->getOp() == kIROp_StructType)
+    {
+        auto structType = cast<IRStructType>(inst);
+        if (structType->findDecoration<IRMetalPackedDecoration>())
+        {
+            auto wasPacked = m_emitPackedVectors;
+            m_emitPackedVectors = true;
+            Super::emitGlobalInstImpl(inst);
+            m_emitPackedVectors = wasPacked;
+            return;
+        }
+    }
     Super::emitGlobalInstImpl(inst);
 }
 

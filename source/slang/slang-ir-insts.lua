@@ -2010,6 +2010,12 @@ local insts = {
 					struct_name = "NonCopyableTypeDecoration",
 				},
 			},
+			{
+				metalPacked = {
+					-- Marks a struct to emit packed vector types on Metal.
+					struct_name = "MetalPackedDecoration",
+				},
+			},
 			{ DisableCopyEliminationDecoration = {} },
 			{
 				DynamicUniform = {

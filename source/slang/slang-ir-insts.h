@@ -4991,6 +4991,11 @@ $(type_info.return_type) $(type_info.method_name)(
         addDecoration(value, kIROp_NonCopyableTypeDecoration);
     }
 
+    void addMetalPackedDecoration(IRInst* value)
+    {
+        addDecoration(value, kIROp_MetalPackedDecoration);
+    }
+
     void addDynamicUniformDecoration(IRInst* value)
     {
         addDecoration(value, kIROp_DynamicUniformDecoration);

@@ -4710,6 +4710,9 @@ typealias NodePayloadPtr = Ptr<T, Access::ReadWrite, (AddressSpace)$((uint64_t)A
 __attributeTarget(StructDecl)
 attribute_syntax [raypayload] : RayPayloadAttribute;
 
+__attributeTarget(StructDecl)
+attribute_syntax [mtl_packed] : MetalPackedAttribute;
+
 //@hidden:
 
 semantic sv_position

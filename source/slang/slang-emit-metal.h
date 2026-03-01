@@ -24,6 +24,7 @@ public:
 
 protected:
     RefPtr<MetalExtensionTracker> m_extensionTracker;
+    bool m_emitPackedVectors = false;
 
     virtual bool isResourceTypeBindless(IRType* type) SLANG_OVERRIDE
     {
