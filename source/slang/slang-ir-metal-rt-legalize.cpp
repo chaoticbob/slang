@@ -95,11 +95,11 @@ static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
             return MetalRTIntrinsic::WorldToObject3x4;
         if (name == toSlice("WorldToObject4x3"))
             return MetalRTIntrinsic::WorldToObject4x3;
-        if (name == toSlice("__metalrt_ReportHit"))
+        if (name == toSlice("ReportHit"))
             return MetalRTIntrinsic::ReportHit;
-        if (name == toSlice("__metalrt_ObjectRayOrigin"))
+        if (name == toSlice("ObjectRayOrigin"))
             return MetalRTIntrinsic::ObjectRayOrigin;
-        if (name == toSlice("__metalrt_ObjectRayDirection"))
+        if (name == toSlice("ObjectRayDirection"))
             return MetalRTIntrinsic::ObjectRayDirection;
     }
     return MetalRTIntrinsic::None;
@@ -1442,8 +1442,25 @@ static void legalizeIntersectionFunction(
     auto float3Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 3);
     auto floatType = builder.getBasicType(BaseType::Float);
     auto uintType = builder.getBasicType(BaseType::UInt);
+    auto boolType = builder.getBoolType();
+
+    // Create the return struct: { bool accept [[accept_intersection]]; float distance [[distance]]; }
+    builder.setInsertBefore(func);
+    auto resultStructType = builder.createStructType();
+    builder.addNameHintDecoration(resultStructType, toSlice("BoundingBoxResult"));
+
+    auto acceptKey = builder.createStructKey();
+    builder.addNameHintDecoration(acceptKey, toSlice("accept"));
+    builder.addTargetSystemValueDecoration(acceptKey, toSlice("accept_intersection"));
+    builder.createStructField(resultStructType, acceptKey, boolType);
+
+    auto distanceKey = builder.createStructKey();
+    builder.addNameHintDecoration(distanceKey, toSlice("distance"));
+    builder.addTargetSystemValueDecoration(distanceKey, toSlice("distance"));
+    builder.createStructField(resultStructType, distanceKey, floatType);
 
     // Origin parameter with [[origin]].
+    builder.setInsertInto(firstBlock);
     auto originParam = builder.emitParam(float3Type);
     builder.addNameHintDecoration(originParam, toSlice("origin"));
     builder.addTargetSystemValueDecoration(originParam, toSlice("origin"));
@@ -1463,13 +1480,6 @@ static void legalizeIntersectionFunction(
     builder.addNameHintDecoration(maxDistParam, toSlice("max_distance"));
     builder.addTargetSystemValueDecoration(maxDistParam, toSlice("max_distance"));
 
-    // Distance output parameter with [[distance]].
-    // In Metal, this is a float& that the intersection function writes to report the hit distance.
-    auto distOutPtrType = builder.getPtrType(floatType, AddressSpace::ThreadLocal);
-    auto distOutParam = builder.emitParam(distOutPtrType);
-    builder.addNameHintDecoration(distOutParam, toSlice("distance"));
-    builder.addTargetSystemValueDecoration(distOutParam, toSlice("distance"));
-
     // PrimitiveId parameter with [[primitive_id]].
     auto primIdParam = builder.emitParam(uintType);
     builder.addNameHintDecoration(primIdParam, toSlice("primitiveId"));
@@ -1480,32 +1490,141 @@ static void legalizeIntersectionFunction(
     builder.addNameHintDecoration(instIdParam, toSlice("instanceId"));
     builder.addTargetSystemValueDecoration(instIdParam, toSlice("instance_id"));
 
-    // Drop payload accesses (same limitation as AnyHit for now).
+    // Replace resource loads from epParamsGlobal with direct function parameters.
+    // Metal intersection functions can only receive device/constant [[buffer(N)]] parameters,
+    // not KernelContext. For each non-payload field that is a buffer type, add a parameter.
+    // Payload fields are dropped (not accessible from intersection functions on Metal).
     for (auto& rep : loadReplacements)
     {
         if (rep.isPayload)
+            continue;
+
+        auto loadInst = rep.load;
+        auto resourceType = loadInst->getDataType();
+
+        // Only add parameters for pointer/buffer types Metal allows in intersection functions.
+        auto ptrType = as<IRPtrTypeBase>(resourceType);
+        if (!ptrType)
+            continue;
+
+        builder.setInsertInto(firstBlock);
+        auto newParam = builder.emitParam(resourceType);
+
+        // Copy name and layout decorations from the field key.
+        auto fieldAddr = as<IRFieldAddress>(as<IRLoad>(loadInst)->getPtr());
+        if (fieldAddr)
         {
-            // Payload not accessible from intersection functions on Metal.
-            // Remove all uses — this will cause downstream code that touches payload to be dead.
-            // If the load has uses, they'll break, but this matches the AnyHit pattern.
+            auto fieldKey = fieldAddr->getField();
+            if (auto nameHint = fieldKey->findDecoration<IRNameHintDecoration>())
+                builder.addNameHintDecoration(newParam, nameHint->getName());
+            if (auto layoutDecor = fieldKey->findDecoration<IRLayoutDecoration>())
+                builder.addLayoutDecoration(newParam, layoutDecor->getLayout());
+        }
+
+        loadInst->replaceUsesWith(newParam);
+    }
+
+    // Replace ALL references to IRGlobalParam/IRGlobalVar within the function body
+    // with function parameters. This prevents the explicit global context pass from
+    // adding a KernelContext parameter (which Metal intersection functions cannot receive).
+    // Handles direct operand references like structuredBufferLoad(%spheres, ...).
+    //
+    // We iterate over the use chain of each global param in the module and check if
+    // any use site is inside this function.
+    {
+        Dictionary<IRInst*, IRParam*> globalMap;
+
+        // Collect all global params from the module.
+        List<IRGlobalParam*> allGlobalParams;
+        for (auto inst : module->getGlobalInsts())
+        {
+            if (auto gp = as<IRGlobalParam>(inst))
+                allGlobalParams.add(gp);
+        }
+
+        // For each global param, check if it has uses in this function.
+        for (auto globalParam : allGlobalParams)
+        {
+            bool usedInFunc = false;
+            for (auto use = globalParam->firstUse; use; use = use->nextUse)
+            {
+                auto user = use->getUser();
+                // Walk up the parent chain to see if this use is inside our function.
+                for (IRInst* parent = user; parent; parent = parent->getParent())
+                {
+                    if (parent == func)
+                    {
+                        usedInFunc = true;
+                        break;
+                    }
+                }
+                if (usedInFunc)
+                    break;
+            }
+
+            if (!usedInFunc)
+                continue;
+
+            // Add a function parameter with the same type.
+            builder.setInsertInto(firstBlock);
+            auto newParam = builder.emitParam(globalParam->getFullType());
+            if (auto nameHint = globalParam->findDecoration<IRNameHintDecoration>())
+                builder.addNameHintDecoration(newParam, nameHint->getName());
+            if (auto layoutDecor = globalParam->findDecoration<IRLayoutDecoration>())
+                builder.addLayoutDecoration(newParam, layoutDecor->getLayout());
+
+            globalMap.add(globalParam, newParam);
+        }
+
+        // Replace uses within this function.
+        for (auto& pair : globalMap)
+        {
+            auto globalParam = pair.first;
+            auto newParam = pair.second;
+
+            // Iterate the use chain and replace uses inside this function.
+            IRUse* nextUse = nullptr;
+            for (auto use = globalParam->firstUse; use; use = nextUse)
+            {
+                nextUse = use->nextUse;
+                auto user = use->getUser();
+
+                // Check if this use is inside our function.
+                bool inFunc = false;
+                for (IRInst* parent = user; parent; parent = parent->getParent())
+                {
+                    if (parent == func)
+                    {
+                        inFunc = true;
+                        break;
+                    }
+                }
+                if (inFunc)
+                {
+                    use->set(newParam);
+                }
+            }
         }
     }
 
-    // Replace RT intrinsic calls and ReportHit.
-    auto boolType = builder.getBoolType();
+    // Helper: build a return value of { accept, distance }.
     auto boolTrue = builder.getBoolValue(true);
     auto boolFalse = builder.getBoolValue(false);
+    auto floatZero = builder.getFloatValue(floatType, 0.0);
 
+    // Replace RT intrinsic calls and ReportHit.
     List<IRInst*> instsToRemove;
     for (auto block : func->getBlocks())
     {
         for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
         {
-            // Replace void returns with `return false` (no hit reported by default).
+            // Replace void returns with `return {false, 0.0f}` (no hit reported).
             if (auto retInst = as<IRReturn>(inst))
             {
                 builder.setInsertBefore(retInst);
-                builder.emitReturn(boolFalse);
+                IRInst* rejectArgs[] = {boolFalse, floatZero};
+                auto rejectVal = builder.emitMakeStruct(resultStructType, 2, rejectArgs);
+                builder.emitReturn(rejectVal);
                 instsToRemove.add(retInst);
                 continue;
             }
@@ -1531,12 +1650,12 @@ static void legalizeIntersectionFunction(
                 break;
             case MetalRTIntrinsic::ReportHit:
                 {
-                    // ReportHit(t, kind, attrs) -> store t into distance output, return true.
-                    // The 'kind' and 'attrs' are dropped for this first version.
+                    // ReportHit(t, kind, attrs) -> return {true, t}.
                     builder.setInsertBefore(call);
                     auto tHit = call->getArg(0);
-                    builder.emitStore(distOutParam, tHit);
-                    builder.emitReturn(boolTrue);
+                    IRInst* acceptArgs[] = {boolTrue, tHit};
+                    auto acceptVal = builder.emitMakeStruct(resultStructType, 2, acceptArgs);
+                    builder.emitReturn(acceptVal);
                     instsToRemove.add(call);
                 }
                 break;
@@ -1562,17 +1681,21 @@ static void legalizeIntersectionFunction(
                 break;
             case MetalRTIntrinsic::IgnoreHit:
                 {
-                    // IgnoreHit() -> return false
+                    // IgnoreHit() -> return {false, 0.0f}
                     builder.setInsertBefore(call);
-                    builder.emitReturn(boolFalse);
+                    IRInst* rejectArgs[] = {boolFalse, floatZero};
+                    auto rejectVal = builder.emitMakeStruct(resultStructType, 2, rejectArgs);
+                    builder.emitReturn(rejectVal);
                     instsToRemove.add(call);
                 }
                 break;
             case MetalRTIntrinsic::AcceptHitAndEndSearch:
                 {
-                    // AcceptHitAndEndSearch() -> return true
+                    // AcceptHitAndEndSearch() -> return {true, 0.0f}
                     builder.setInsertBefore(call);
-                    builder.emitReturn(boolTrue);
+                    IRInst* acceptArgs[] = {boolTrue, floatZero};
+                    auto acceptVal = builder.emitMakeStruct(resultStructType, 2, acceptArgs);
+                    builder.emitReturn(acceptVal);
                     instsToRemove.add(call);
                 }
                 break;
@@ -1617,7 +1740,7 @@ static void legalizeIntersectionFunction(
         epParamsGlobal->removeAndDeallocate();
     }
 
-    // Change the function return type to bool.
+    // Change the function return type to BoundingBoxResult struct.
     auto funcType = as<IRFuncType>(func->getDataType());
     if (funcType)
     {
@@ -1626,7 +1749,7 @@ static void legalizeIntersectionFunction(
         {
             paramTypes.add(funcType->getParamType(i));
         }
-        auto newFuncType = builder.getFuncType(paramTypes, boolType);
+        auto newFuncType = builder.getFuncType(paramTypes, resultStructType);
         func->setFullType(newFuncType);
     }
 

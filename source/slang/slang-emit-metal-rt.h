@@ -18,6 +18,7 @@ public:
     }
 
 protected:
+    virtual void beforeComputeEmitActions(IRModule* module) SLANG_OVERRIDE;
     virtual void emitFrontMatterImpl(TargetRequest* targetReq) SLANG_OVERRIDE;
     virtual void emitEntryPointAttributesImpl(
         IRFunc* irFunc,

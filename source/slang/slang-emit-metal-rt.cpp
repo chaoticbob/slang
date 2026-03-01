@@ -6,14 +6,14 @@
 namespace Slang
 {
 
-void MetalRTSourceEmitter::emitFrontMatterImpl(TargetRequest* targetReq)
+void MetalRTSourceEmitter::beforeComputeEmitActions(IRModule* module)
 {
-    Super::emitFrontMatterImpl(targetReq);
-    m_writer->emit("#include <metal_raytracing>\n");
-    m_writer->emit("using namespace metal::raytracing;\n");
+    Super::beforeComputeEmitActions(module);
 
     // Scan for intersection stage to determine geometry type.
-    for (auto inst : m_irModule->getGlobalInsts())
+    // Must happen before emit actions so m_isProcedural is set
+    // when intersector/function_table templates are emitted.
+    for (auto inst : module->getGlobalInsts())
     {
         if (auto func = as<IRFunc>(inst))
         {
@@ -27,6 +27,13 @@ void MetalRTSourceEmitter::emitFrontMatterImpl(TargetRequest* targetReq)
             }
         }
     }
+}
+
+void MetalRTSourceEmitter::emitFrontMatterImpl(TargetRequest* targetReq)
+{
+    Super::emitFrontMatterImpl(targetReq);
+    m_writer->emit("#include <metal_raytracing>\n");
+    m_writer->emit("using namespace metal::raytracing;\n");
 }
 
 void MetalRTSourceEmitter::emitEntryPointAttributesImpl(

@@ -255,10 +255,10 @@ void legalizeIRForMetal(IRModule* module, TargetProgram* targetProgram, Diagnost
         {
             if (auto entryPointDecor = func->findDecoration<IREntryPointDecoration>())
             {
-                // Skip RT functions (ClosestHit/Miss/AnyHit) — they are legalized
+                // Skip RT functions (ClosestHit/Miss/AnyHit/Intersection) — they are legalized
                 // by legalizeIRForMetalRT and must not receive resource params.
                 auto stage = entryPointDecor->getProfile().getStage();
-                if (stage != Stage::ClosestHit && stage != Stage::Miss && stage != Stage::AnyHit)
+                if (stage != Stage::ClosestHit && stage != Stage::Miss && stage != Stage::AnyHit && stage != Stage::Intersection)
                 {
                     EntryPointInfo info;
                     info.entryPointDecor = entryPointDecor;
