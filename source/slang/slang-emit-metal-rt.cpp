@@ -11,6 +11,22 @@ void MetalRTSourceEmitter::emitFrontMatterImpl(TargetRequest* targetReq)
     Super::emitFrontMatterImpl(targetReq);
     m_writer->emit("#include <metal_raytracing>\n");
     m_writer->emit("using namespace metal::raytracing;\n");
+
+    // Scan for intersection stage to determine geometry type.
+    for (auto inst : m_irModule->getGlobalInsts())
+    {
+        if (auto func = as<IRFunc>(inst))
+        {
+            if (auto ep = func->findDecoration<IREntryPointDecoration>())
+            {
+                if (ep->getProfile().getStage() == Stage::Intersection)
+                {
+                    m_isProcedural = true;
+                    break;
+                }
+            }
+        }
+    }
 }
 
 void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
@@ -31,6 +47,11 @@ void MetalRTSourceEmitter::emitEntryPointAttributesImpl(
             m_writer->emit("[[intersection(triangle, triangle_data, instancing, world_space_data)]] ");
         }
         break;
+    case Stage::Intersection:
+        {
+            m_writer->emit("[[intersection(bounding_box, instancing, world_space_data)]] ");
+        }
+        break;
     default:
         {
             Super::emitEntryPointAttributesImpl(irFunc, entryPointDecor);
@@ -46,8 +67,11 @@ void MetalRTSourceEmitter::emitSimpleFuncParamImpl(IRParam* param)
     {
         if (nameHint->getName() == toSlice("_metalrt_func_table"))
         {
-            // Emit: intersection_function_table<triangle_data, instancing, world_space_data> name
-            m_writer->emit("intersection_function_table<triangle_data, instancing, world_space_data> ");
+            // Emit intersection_function_table with correct template tags for geometry type.
+            if (m_isProcedural)
+                m_writer->emit("intersection_function_table<instancing, world_space_data> ");
+            else
+                m_writer->emit("intersection_function_table<triangle_data, instancing, world_space_data> ");
             m_writer->emit(getName(param));
             if (auto sysVal = param->findDecoration<IRTargetSystemValueDecoration>())
             {
@@ -122,8 +146,11 @@ bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
             int idx = m_intersectorCounter++;
             auto resultName = getName(inst);
 
-            // Emit intersector template.
-            m_writer->emit("intersector<triangle_data, instancing, world_space_data> _i_");
+            // Emit intersector template with correct tags for geometry type.
+            if (m_isProcedural)
+                m_writer->emit("intersector<instancing, world_space_data> _i_");
+            else
+                m_writer->emit("intersector<triangle_data, instancing, world_space_data> _i_");
             m_writer->emit(idx);
             m_writer->emit(";\n");
 

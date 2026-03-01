@@ -29,6 +29,7 @@ protected:
 
 private:
     int m_intersectorCounter = 0;
+    bool m_isProcedural = false;
 };
 
 } // namespace Slang

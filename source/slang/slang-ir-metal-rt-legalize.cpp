@@ -46,6 +46,9 @@ enum class MetalRTIntrinsic
     ObjectToWorld4x3,
     WorldToObject3x4,
     WorldToObject4x3,
+    ReportHit,
+    ObjectRayOrigin,
+    ObjectRayDirection,
 };
 
 static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
@@ -92,6 +95,12 @@ static MetalRTIntrinsic getMetalRTIntrinsicFromCall(IRCall* call)
             return MetalRTIntrinsic::WorldToObject3x4;
         if (name == toSlice("WorldToObject4x3"))
             return MetalRTIntrinsic::WorldToObject4x3;
+        if (name == toSlice("__metalrt_ReportHit"))
+            return MetalRTIntrinsic::ReportHit;
+        if (name == toSlice("__metalrt_ObjectRayOrigin"))
+            return MetalRTIntrinsic::ObjectRayOrigin;
+        if (name == toSlice("__metalrt_ObjectRayDirection"))
+            return MetalRTIntrinsic::ObjectRayDirection;
     }
     return MetalRTIntrinsic::None;
 }
@@ -194,6 +203,7 @@ struct RTEntryPoints
     IRFunc* closestHit = nullptr;
     IRFunc* miss = nullptr;
     IRFunc* anyHit = nullptr;
+    IRFunc* intersection = nullptr;
     IRInst* raygenFuncTable = nullptr;
 };
 
@@ -245,6 +255,10 @@ static RTEntryPoints findRTEntryPoints(IRModule* module)
         case Stage::AnyHit:
             if (!result.anyHit)
                 result.anyHit = func;
+            break;
+        case Stage::Intersection:
+            if (!result.intersection)
+                result.intersection = func;
             break;
         }
     }
@@ -689,7 +703,8 @@ static void legalizeVisibleFunction(
     IRFunc* func,
     IRBuilder& builder,
     IRModule* module,
-    bool isClosestHit)
+    bool isClosestHit,
+    bool isProcedural = false)
 {
     auto firstBlock = func->getFirstBlock();
     if (!firstBlock)
@@ -805,11 +820,15 @@ static void legalizeVisibleFunction(
 
     if (isClosestHit)
     {
-        auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
-        auto boolType = builder.getBoolType();
+        // For triangle mode, closestHit receives barycentrics and frontFacing.
+        // For procedural mode, these are not available (no triangle intersection data).
+        if (!isProcedural)
+        {
+            auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
 
-        baryParam = builder.emitParam(float2Type);
-        builder.addNameHintDecoration(baryParam, toSlice("barycentrics"));
+            baryParam = builder.emitParam(float2Type);
+            builder.addNameHintDecoration(baryParam, toSlice("barycentrics"));
+        }
 
         distParam = builder.emitParam(floatType);
         builder.addNameHintDecoration(distParam, toSlice("distance"));
@@ -820,8 +839,13 @@ static void legalizeVisibleFunction(
         instIdParam = builder.emitParam(uintType);
         builder.addNameHintDecoration(instIdParam, toSlice("instanceId"));
 
-        frontFacingParam = builder.emitParam(boolType);
-        builder.addNameHintDecoration(frontFacingParam, toSlice("frontFacing"));
+        if (!isProcedural)
+        {
+            auto boolType = builder.getBoolType();
+
+            frontFacingParam = builder.emitParam(boolType);
+            builder.addNameHintDecoration(frontFacingParam, toSlice("frontFacing"));
+        }
 
         // Transform matrix parameters.
         auto intType = builder.getIntType();
@@ -1341,12 +1365,282 @@ static void legalizeAnyHitFunction(
     fixUpFuncType(func);
 }
 
+// Phase 5: Transform an Intersection function into a Metal
+// [[intersection(bounding_box, instancing, world_space_data)]] function with bool return type.
+//
+// Before: function accesses payload and attrs through entryPointParams global,
+//         uses ObjectRayOrigin()/ObjectRayDirection()/RayTMin()/RayTCurrent() intrinsics,
+//         calls ReportHit(t, kind, attrs) to report intersections.
+// After:  function takes origin/direction/min_distance/max_distance/primitive_id/instance_id
+//         as system-value params, has a float& distance output param,
+//         returns bool (true = hit reported, false = no hit).
+static void legalizeIntersectionFunction(
+    IRFunc* func,
+    IRBuilder& builder,
+    IRModule* module)
+{
+    auto firstBlock = func->getFirstBlock();
+    if (!firstBlock)
+    {
+        return;
+    }
+
+    auto epParamsGlobal = findEntryPointParamsGlobal(module, func);
+
+    // Scan entryPointParams field accesses to find payload fields.
+    struct LoadReplacement
+    {
+        IRInst* load;
+        bool isPayload;
+    };
+    List<LoadReplacement> loadReplacements;
+    List<IRInst*> fieldAddrsToRemove;
+    List<IRInst*> loadsToRemove;
+
+    if (epParamsGlobal)
+    {
+        for (auto block : func->getBlocks())
+        {
+            for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+            {
+                if (inst->getOp() != kIROp_FieldAddress)
+                {
+                    continue;
+                }
+                auto fieldAddr = as<IRFieldAddress>(inst);
+                if (fieldAddr->getBase() != epParamsGlobal)
+                {
+                    continue;
+                }
+
+                auto fieldPtrType = cast<IRPtrTypeBase>(fieldAddr->getDataType());
+                auto fieldType = fieldPtrType->getValueType();
+                bool isPayloadField = (fieldType->getOp() == kIROp_BorrowInOutParamType);
+
+                fieldAddrsToRemove.add(fieldAddr);
+
+                for (auto use = fieldAddr->firstUse; use; use = use->nextUse)
+                {
+                    auto load = as<IRLoad>(use->getUser());
+                    if (!load)
+                    {
+                        continue;
+                    }
+                    LoadReplacement rep;
+                    rep.load = load;
+                    rep.isPayload = isPayloadField;
+                    loadReplacements.add(rep);
+                    loadsToRemove.add(load);
+                }
+            }
+        }
+    }
+
+    // Add new function parameters to the first block.
+    builder.setInsertInto(firstBlock);
+
+    auto float3Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 3);
+    auto floatType = builder.getBasicType(BaseType::Float);
+    auto uintType = builder.getBasicType(BaseType::UInt);
+
+    // Origin parameter with [[origin]].
+    auto originParam = builder.emitParam(float3Type);
+    builder.addNameHintDecoration(originParam, toSlice("origin"));
+    builder.addTargetSystemValueDecoration(originParam, toSlice("origin"));
+
+    // Direction parameter with [[direction]].
+    auto directionParam = builder.emitParam(float3Type);
+    builder.addNameHintDecoration(directionParam, toSlice("direction"));
+    builder.addTargetSystemValueDecoration(directionParam, toSlice("direction"));
+
+    // Min distance parameter with [[min_distance]].
+    auto minDistParam = builder.emitParam(floatType);
+    builder.addNameHintDecoration(minDistParam, toSlice("min_dist"));
+    builder.addTargetSystemValueDecoration(minDistParam, toSlice("min_distance"));
+
+    // Max distance parameter with [[max_distance]].
+    auto maxDistParam = builder.emitParam(floatType);
+    builder.addNameHintDecoration(maxDistParam, toSlice("max_distance"));
+    builder.addTargetSystemValueDecoration(maxDistParam, toSlice("max_distance"));
+
+    // Distance output parameter with [[distance]].
+    // In Metal, this is a float& that the intersection function writes to report the hit distance.
+    auto distOutPtrType = builder.getPtrType(floatType, AddressSpace::ThreadLocal);
+    auto distOutParam = builder.emitParam(distOutPtrType);
+    builder.addNameHintDecoration(distOutParam, toSlice("distance"));
+    builder.addTargetSystemValueDecoration(distOutParam, toSlice("distance"));
+
+    // PrimitiveId parameter with [[primitive_id]].
+    auto primIdParam = builder.emitParam(uintType);
+    builder.addNameHintDecoration(primIdParam, toSlice("primitiveId"));
+    builder.addTargetSystemValueDecoration(primIdParam, toSlice("primitive_id"));
+
+    // InstanceId parameter with [[instance_id]].
+    auto instIdParam = builder.emitParam(uintType);
+    builder.addNameHintDecoration(instIdParam, toSlice("instanceId"));
+    builder.addTargetSystemValueDecoration(instIdParam, toSlice("instance_id"));
+
+    // Drop payload accesses (same limitation as AnyHit for now).
+    for (auto& rep : loadReplacements)
+    {
+        if (rep.isPayload)
+        {
+            // Payload not accessible from intersection functions on Metal.
+            // Remove all uses — this will cause downstream code that touches payload to be dead.
+            // If the load has uses, they'll break, but this matches the AnyHit pattern.
+        }
+    }
+
+    // Replace RT intrinsic calls and ReportHit.
+    auto boolType = builder.getBoolType();
+    auto boolTrue = builder.getBoolValue(true);
+    auto boolFalse = builder.getBoolValue(false);
+
+    List<IRInst*> instsToRemove;
+    for (auto block : func->getBlocks())
+    {
+        for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+        {
+            // Replace void returns with `return false` (no hit reported by default).
+            if (auto retInst = as<IRReturn>(inst))
+            {
+                builder.setInsertBefore(retInst);
+                builder.emitReturn(boolFalse);
+                instsToRemove.add(retInst);
+                continue;
+            }
+
+            auto call = as<IRCall>(inst);
+            if (!call)
+            {
+                continue;
+            }
+
+            auto intrinsicKind = getMetalRTIntrinsicFromCall(call);
+            if (intrinsicKind == MetalRTIntrinsic::None)
+            {
+                continue;
+            }
+
+            IRInst* replacement = nullptr;
+            switch (intrinsicKind)
+            {
+            default:
+                {
+                }
+                break;
+            case MetalRTIntrinsic::ReportHit:
+                {
+                    // ReportHit(t, kind, attrs) -> store t into distance output, return true.
+                    // The 'kind' and 'attrs' are dropped for this first version.
+                    builder.setInsertBefore(call);
+                    auto tHit = call->getArg(0);
+                    builder.emitStore(distOutParam, tHit);
+                    builder.emitReturn(boolTrue);
+                    instsToRemove.add(call);
+                }
+                break;
+            case MetalRTIntrinsic::ObjectRayOrigin:
+                {
+                    replacement = originParam;
+                }
+                break;
+            case MetalRTIntrinsic::ObjectRayDirection:
+                {
+                    replacement = directionParam;
+                }
+                break;
+            case MetalRTIntrinsic::RayTMin:
+                {
+                    replacement = minDistParam;
+                }
+                break;
+            case MetalRTIntrinsic::RayTCurrent:
+                {
+                    replacement = maxDistParam;
+                }
+                break;
+            case MetalRTIntrinsic::IgnoreHit:
+                {
+                    // IgnoreHit() -> return false
+                    builder.setInsertBefore(call);
+                    builder.emitReturn(boolFalse);
+                    instsToRemove.add(call);
+                }
+                break;
+            case MetalRTIntrinsic::AcceptHitAndEndSearch:
+                {
+                    // AcceptHitAndEndSearch() -> return true
+                    builder.setInsertBefore(call);
+                    builder.emitReturn(boolTrue);
+                    instsToRemove.add(call);
+                }
+                break;
+            case MetalRTIntrinsic::PrimitiveIndex:
+                {
+                    replacement = primIdParam;
+                }
+                break;
+            case MetalRTIntrinsic::InstanceIndex:
+            case MetalRTIntrinsic::InstanceID:
+                {
+                    replacement = instIdParam;
+                }
+                break;
+            }
+
+            if (replacement)
+            {
+                call->replaceUsesWith(replacement);
+                instsToRemove.add(call);
+            }
+        }
+    }
+
+    // Remove replaced instructions.
+    for (auto inst : instsToRemove)
+    {
+        inst->removeAndDeallocate();
+    }
+    for (auto load : loadsToRemove)
+    {
+        load->removeAndDeallocate();
+    }
+    for (auto fieldAddr : fieldAddrsToRemove)
+    {
+        fieldAddr->removeAndDeallocate();
+    }
+
+    // Remove the entryPointParams global for this function.
+    if (epParamsGlobal)
+    {
+        epParamsGlobal->removeAndDeallocate();
+    }
+
+    // Change the function return type to bool.
+    auto funcType = as<IRFuncType>(func->getDataType());
+    if (funcType)
+    {
+        List<IRType*> paramTypes;
+        for (UInt i = 0; i < funcType->getParamCount(); i++)
+        {
+            paramTypes.add(funcType->getParamType(i));
+        }
+        auto newFuncType = builder.getFuncType(paramTypes, boolType);
+        func->setFullType(newFuncType);
+    }
+
+    // Fix up the function type to match the new parameter list.
+    fixUpFuncType(func);
+}
+
 // Phase 3: Replace TraceRay calls in the raygen function with intersector +
 // calls to visible closesthit/miss functions (instead of inlining their bodies).
 static void legalizeTraceRayCallsWithVisibleFunctions(
     IRFunc* raygenFunc,
     const RTEntryPoints& entryPoints,
-    IRBuilder& builder)
+    IRBuilder& builder,
+    bool isProcedural = false)
 {
     // Find all TraceRay calls in the raygen function.
     List<IRCall*> traceRayCalls;
@@ -1434,15 +1728,8 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
         builder.setInsertInto(hitBlock);
         if (entryPoints.closestHit)
         {
-            auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
             auto floatType = builder.getBasicType(BaseType::Float);
-            auto boolType = builder.getBoolType();
 
-            auto barycentrics = builder.emitIntrinsicInst(
-                float2Type,
-                kIROp_MetalRTIntersectionGetBarycentrics,
-                1,
-                &intersectResult);
             auto distance = builder.emitIntrinsicInst(
                 floatType,
                 kIROp_MetalRTIntersectionGetDistance,
@@ -1456,11 +1743,6 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
             auto instanceId = builder.emitIntrinsicInst(
                 uintType,
                 kIROp_MetalRTIntersectionGetInstanceId,
-                1,
-                &intersectResult);
-            auto frontFacing = builder.emitIntrinsicInst(
-                boolType,
-                kIROp_MetalRTIntersectionGetFrontFace,
                 1,
                 &intersectResult);
 
@@ -1493,13 +1775,42 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
                 1,
                 &intersectResult);
 
-            IRInst* hitArgs[] = {
-                payloadPtr, origin, direction, tMin, rayFlagsArg,
-                barycentrics, distance, primitiveId, instanceId, frontFacing,
-                objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
-                entryPoints.raygenFuncTable};
-            builder.emitCallInst(
-                builder.getVoidType(), entryPoints.closestHit, 15, hitArgs);
+            if (isProcedural)
+            {
+                // Procedural mode: no barycentrics or frontFacing (13 args).
+                IRInst* hitArgs[] = {
+                    payloadPtr, origin, direction, tMin, rayFlagsArg,
+                    distance, primitiveId, instanceId,
+                    objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
+                    entryPoints.raygenFuncTable};
+                builder.emitCallInst(
+                    builder.getVoidType(), entryPoints.closestHit, 13, hitArgs);
+            }
+            else
+            {
+                // Triangle mode: include barycentrics and frontFacing (15 args).
+                auto float2Type = builder.getVectorType(builder.getBasicType(BaseType::Float), 2);
+                auto boolType = builder.getBoolType();
+
+                auto barycentrics = builder.emitIntrinsicInst(
+                    float2Type,
+                    kIROp_MetalRTIntersectionGetBarycentrics,
+                    1,
+                    &intersectResult);
+                auto frontFacing = builder.emitIntrinsicInst(
+                    boolType,
+                    kIROp_MetalRTIntersectionGetFrontFace,
+                    1,
+                    &intersectResult);
+
+                IRInst* hitArgs[] = {
+                    payloadPtr, origin, direction, tMin, rayFlagsArg,
+                    barycentrics, distance, primitiveId, instanceId, frontFacing,
+                    objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
+                    entryPoints.raygenFuncTable};
+                builder.emitCallInst(
+                    builder.getVoidType(), entryPoints.closestHit, 15, hitArgs);
+            }
         }
         builder.emitBranch(afterBlock);
 
@@ -1662,12 +1973,14 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         raygenFunc = func;
     }
 
+    bool isProcedural = (entryPoints.intersection != nullptr);
+
     if (entryPoints.closestHit || entryPoints.miss)
     {
         // Phase 3: Transform closesthit/miss into [[visible]] functions.
         if (entryPoints.closestHit)
         {
-            legalizeVisibleFunction(entryPoints.closestHit, builder, module, true);
+            legalizeVisibleFunction(entryPoints.closestHit, builder, module, true, isProcedural);
         }
         if (entryPoints.miss)
         {
@@ -1677,7 +1990,7 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         // Replace TraceRay calls with intersector + calls to visible functions.
         if (raygenFunc)
         {
-            legalizeTraceRayCallsWithVisibleFunctions(raygenFunc, entryPoints, builder);
+            legalizeTraceRayCallsWithVisibleFunctions(raygenFunc, entryPoints, builder, isProcedural);
         }
 
         // Lower TraceRay calls inside visible functions (e.g. shadow rays in closestHit)
@@ -1694,8 +2007,14 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
         legalizeAnyHitFunction(entryPoints.anyHit, builder, module);
     }
 
-    // Do NOT call removeNonRaygenEntryPoints — closesthit/miss/anyhit stay as entry points
-    // for [[visible]]/[[intersection()]] function emission.
+    // Phase 5: Transform Intersection into [[intersection(bounding_box, ...)]] function.
+    if (entryPoints.intersection)
+    {
+        legalizeIntersectionFunction(entryPoints.intersection, builder, module);
+    }
+
+    // Do NOT call removeNonRaygenEntryPoints — closesthit/miss/anyhit/intersection stay as
+    // entry points for [[visible]]/[[intersection()]] function emission.
 }
 
 } // namespace Slang

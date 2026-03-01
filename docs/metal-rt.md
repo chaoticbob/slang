@@ -12,23 +12,25 @@ translation in Slang's Metal backend.
 | ClosestHit | `[[visible]]` function | Supported |
 | Miss | `[[visible]]` function | Supported |
 | AnyHit | `[[intersection(triangle, instancing)]]` | Supported |
-| Intersection | `[[intersection(bounding_box, instancing)]]` | Not supported |
+| Intersection | `[[intersection(bounding_box, instancing)]]` | Supported (single-mode, no custom attrs) |
 | Callable | — | Not supported |
 
 ## General Limitations
 
 - **Single entry point per stage.** Only one raygen, one closesthit, one miss,
-  and one anyhit function are discovered per compilation. Multiple shaders of
-  the same stage type are not supported.
+  one anyhit, and one intersection function are discovered per compilation.
+  Multiple shaders of the same stage type are not supported.
 
 - **No recursive TraceRay.** TraceRay is lowered to an inline
   `intersector.intersect()` call with closesthit/miss dispatched as visible
   function calls from the raygen kernel. Recursive trace calls from closesthit
   or miss shaders are not handled.
 
-- **Triangle geometry only.** The intersector is always configured as
-  `intersector<triangle_data, instancing>`. Procedural (AABB) geometry is not
-  supported.
+- **No mixed triangle + procedural geometry.** A compilation unit is either
+  all-triangle (using AnyHit intersection functions) or all-procedural (using
+  Intersection functions). Mixed geometry types within a single acceleration
+  structure are not supported. The intersector template, function table type,
+  and closestHit parameter lists are configured for one mode at compile time.
 
 - **Fixed thread group size.** The raygen compute kernel is emitted with
   `[numthreads(8, 8, 1)]`. This is not configurable.
@@ -61,37 +63,44 @@ translation in Slang's Metal backend.
   raygen-calls-visible-function pattern but would not work if these functions
   were called from a different address space context.
 
-## Intersection Shader (Not Supported)
+## Intersection Shader Limitations
 
-DXR intersection shaders (`[shader("intersection")]`) for procedural/AABB
-geometry are not implemented. Metal uses the same intersection function concept
-for both DXR's AnyHit (triangle) and DXR's Intersection (procedural) — the
-difference is the `triangle` vs `bounding_box` tag. The basic DXR-to-Metal
-mapping would be:
+The basic case — a single `ReportHit()` call with no custom hit attributes
+beyond the hit distance — is implemented. The intersection function is emitted
+as a `[[intersection(bounding_box, instancing, world_space_data)]]` function
+that returns `bool`. The DXR-to-Metal mapping is:
 
 | DXR | Metal |
 |---|---|
-| `[shader("intersection")]` | `[[intersection(bounding_box, instancing)]]` |
+| `[shader("intersection")]` | `[[intersection(bounding_box, instancing, world_space_data)]]` |
 | `ObjectRayOrigin()` | `float3 origin [[origin]]` parameter |
 | `ObjectRayDirection()` | `float3 direction [[direction]]` parameter |
 | `RayTMin()` | `float min_dist [[min_distance]]` parameter |
-| `ReportHit(t, kind, attrs)` | Set distance in result, return `true` |
+| `RayTCurrent()` | `float max_dist [[max_distance]]` parameter |
+| `ReportHit(t, kind, attrs)` | Store `t` into `distance` output, return `true` |
 | No hit reported | Return `false` |
 
-### What would work
+Current limitations:
 
-The simple case — a single `ReportHit()` call with no custom hit attributes
-beyond the hit distance — maps cleanly to a `bounding_box` intersection
-function using the same pattern as the AnyHit translation. The function returns
-`bool`, and the hit distance is communicated through the result.
+- **No custom hit attributes.** The `attributes` parameter of
+  `ReportHit(t, kind, attrs)` is ignored. Only the hit distance `t` is
+  communicated to the closest hit shader.
 
-### Challenges
+- **Single ReportHit only.** If multiple `ReportHit()` calls are present, only
+  the last one executed takes effect. The shader does not track the closest `t`
+  across calls.
+
+- **No ObjectRayOrigin/ObjectRayDirection in ClosestHit.** These intrinsics are
+  only available inside the intersection function itself, not in the closest hit
+  shader (they come from Metal system value parameters on the intersection
+  function).
+
+### Remaining Challenges
 
 - **Multiple `ReportHit()` calls.** DXR allows calling `ReportHit()` multiple
   times within one intersection shader invocation to report multiple candidate
-  hits. Metal's bounding box intersection function returns a single result. A
-  shader with multiple `ReportHit()` calls would need to be transformed to
-  track the closest `t` value across all calls and return only that one.
+  hits. A shader with multiple `ReportHit()` calls would need to be transformed
+  to track the closest `t` value across all calls and return only that one.
 
 - **Custom hit attributes.** DXR passes an arbitrary struct through
   `ReportHit(t, kind, attrs)` that is later available in the ClosestHit and
@@ -101,11 +110,6 @@ function using the same pattern as the AnyHit translation. The function returns
   device buffer keyed by primitive ID during intersection, then read them back
   in ClosestHit/AnyHit — but this requires host-side buffer allocation and
   introduces synchronization concerns.
-
-- **Intersector tag change.** The raygen kernel's intersector would need to use
-  a different template configuration for AABB geometry. Supporting mixed
-  triangle and procedural geometry in the same scene would require additional
-  complexity.
 
 ## Callable Shaders (Not Supported)
 

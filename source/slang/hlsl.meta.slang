@@ -19434,13 +19434,15 @@ bool __reportIntersection(float tHit, uint hitKind)
 /// @category raytracing
 __generic<A>
 [ForceInline]
-[require(glsl_hlsl_spirv, raytracing_intersection)]
+[require(glsl_hlsl_metal_spirv, raytracing_intersection)]
 bool ReportHit(float tHit, uint hitKind, A attributes)
 {
     __target_switch
     {
     case hlsl:
         __intrinsic_asm "ReportHit($0, $1, $2)";
+    case metal:
+        __intrinsic_asm "(__metalrt_ReportHit)";
     case glsl:
     case spirv:
         [__vulkanHitAttributes]
@@ -19766,6 +19768,7 @@ float3 ObjectRayOrigin()
     case hlsl:  __intrinsic_asm "ObjectRayOrigin";
     case glsl: __intrinsic_asm "(gl_ObjectRayOriginEXT)";
     case cuda: __intrinsic_asm "optixGetObjectRayOrigin";
+    case metal: __intrinsic_asm "(__metalrt_ObjectRayOrigin)";
     case spirv:
         return spirv_asm
         {
@@ -19787,6 +19790,7 @@ float3 ObjectRayDirection()
     case hlsl:  __intrinsic_asm "ObjectRayDirection";
     case glsl: __intrinsic_asm "(gl_ObjectRayDirectionEXT)";
     case cuda: __intrinsic_asm "optixGetObjectRayDirection";
+    case metal: __intrinsic_asm "(__metalrt_ObjectRayDirection)";
     case spirv:
         return spirv_asm
         {
