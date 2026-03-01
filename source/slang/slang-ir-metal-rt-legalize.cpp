@@ -1916,9 +1916,11 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
         // Check for RAY_FLAG_SKIP_CLOSEST_HIT_SHADER (0x08).
         // If rayFlags is a compile-time constant, check statically.
         bool skipClosestHit = false;
+        bool forceNonOpaque = false;
         if (auto flagsLit = as<IRIntLit>(rayFlagsArg))
         {
             skipClosestHit = (flagsLit->getValue() & 0x08) != 0;
+            forceNonOpaque = (flagsLit->getValue() & 0x02) != 0;
         }
 
         // Determine which miss shader to call.
@@ -1942,16 +1944,30 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
         builder.setInsertBefore(call);
 
         // Emit MetalRTIntersect instruction.
-        // For procedural mode, use 9-operand form with an attrs variable that the
-        // intersection function writes to via ray_data [[payload]].
+        // Use 9-operand form (with IFT + payload) when:
+        //   - Procedural mode: intersection function writes attrs via ray_data [[payload]]
+        //   - FORCE_NON_OPAQUE with anyhit: anyhit (triangle intersection function) needs
+        //     the payload via ray_data to read/write shadow hit results
+        // Use 7-operand form (no IFT) otherwise: no intersection functions need to run.
         IRInst* attrsVar = nullptr;
         IRInst* intersectResult = nullptr;
+        bool needsAnyhitPayload = forceNonOpaque && entryPoints.anyHit;
         if (isProcedural && proceduralAttrsType)
         {
             attrsVar = builder.emitVar(proceduralAttrsType);
             IRInst* intersectArgs[] = {
                 accel, origin, direction, tMin, tMax,
                 rayFlagsArg, instanceMask, entryPoints.raygenFuncTable, attrsVar};
+            intersectResult = builder.emitIntrinsicInst(
+                uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
+        }
+        else if (needsAnyhitPayload)
+        {
+            // Shadow ray pattern: pass the DXR payload to intersect() so the
+            // anyhit [[intersection(triangle)]] function can access it via ray_data.
+            IRInst* intersectArgs[] = {
+                accel, origin, direction, tMin, tMax,
+                rayFlagsArg, instanceMask, entryPoints.raygenFuncTable, payloadPtr};
             intersectResult = builder.emitIntrinsicInst(
                 uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
         }
