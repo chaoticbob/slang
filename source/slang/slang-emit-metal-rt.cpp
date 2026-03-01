@@ -201,17 +201,33 @@ bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
                 auto rayFlags = inst->getOperand(5);
                 bool hasIFT = inst->getOperandCount() >= 9;
 
-                m_writer->emit("if (");
-                emitOperand(rayFlags, getInfo(EmitOp::General));
-                m_writer->emit(" & 0x01u) _i_");
-                m_writer->emit(idx);
-                m_writer->emit(".force_opacity(forced_opacity::opaque);\n");
+                // In procedural (bounding_box) mode, force all geometry to
+                // non-opaque so intersection functions are always called.
+                // Metal skips [[intersection(...)]] functions for opaque geometry,
+                // but bounding_box intersection functions MUST always run
+                // (there is no built-in AABB intersection).
+                // DXR's RAY_FLAG_FORCE_OPAQUE only skips any-hit shaders, not
+                // intersection shaders.
+                if (m_isProcedural)
+                {
+                    m_writer->emit("_i_");
+                    m_writer->emit(idx);
+                    m_writer->emit(".force_opacity(forced_opacity::non_opaque);\n");
+                }
+                else
+                {
+                    m_writer->emit("if (");
+                    emitOperand(rayFlags, getInfo(EmitOp::General));
+                    m_writer->emit(" & 0x01u) _i_");
+                    m_writer->emit(idx);
+                    m_writer->emit(".force_opacity(forced_opacity::opaque);\n");
 
-                m_writer->emit("if (");
-                emitOperand(rayFlags, getInfo(EmitOp::General));
-                m_writer->emit(" & 0x02u) _i_");
-                m_writer->emit(idx);
-                m_writer->emit(".force_opacity(forced_opacity::non_opaque);\n");
+                    m_writer->emit("if (");
+                    emitOperand(rayFlags, getInfo(EmitOp::General));
+                    m_writer->emit(" & 0x02u) _i_");
+                    m_writer->emit(idx);
+                    m_writer->emit(".force_opacity(forced_opacity::non_opaque);\n");
+                }
 
                 // Metal's accept_any_intersection(true) skips intersection functions
                 // entirely. In DXR, RAY_FLAG_ACCEPT_FIRST_HIT still runs any-hit
@@ -255,8 +271,20 @@ bool MetalRTSourceEmitter::tryEmitInstStmtImpl(IRInst* inst)
                 emitOperand(inst->getOperand(6), getInfo(EmitOp::General));
                 m_writer->emit(", ");
                 emitOperand(inst->getOperand(7), getInfo(EmitOp::General));
-                m_writer->emit(", *");
-                emitOperand(inst->getOperand(8), getInfo(EmitOp::General));
+                // Payload operand: local variables (IRVar) must be emitted as
+                // a direct variable name for Metal's ray_data write-back to work.
+                // Device pointer params need * to dereference.
+                auto payloadOperand = inst->getOperand(8);
+                m_writer->emit(", ");
+                if (as<IRVar>(payloadOperand))
+                {
+                    m_writer->emit(getName(payloadOperand));
+                }
+                else
+                {
+                    m_writer->emit("*");
+                    emitOperand(payloadOperand, getInfo(EmitOp::General));
+                }
                 m_writer->emit(");\n");
             }
             else

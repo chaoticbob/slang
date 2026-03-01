@@ -19205,6 +19205,7 @@ __generic<payload_t>
 void __metalrt_TraceRay(
     RaytracingAccelerationStructure AccelerationStructure,
     uint RayFlags, uint InstanceInclusionMask,
+    uint MissShaderIndex,
     float3 Origin, float TMin, float3 Direction, float TMax,
     inout payload_t Payload)
 {
@@ -19251,7 +19252,7 @@ void TraceRay(
     case cuda: __intrinsic_asm "optixTrace";
     case metal:
         __metalrt_TraceRay(AccelerationStructure, RayFlags, InstanceInclusionMask,
-            Ray.Origin, Ray.TMin, Ray.Direction, Ray.TMax, Payload);
+            MissShaderIndex, Ray.Origin, Ray.TMin, Ray.Direction, Ray.TMax, Payload);
         return;
     case glsl:
     {

@@ -201,7 +201,7 @@ struct RTEntryPoints
 {
     IRFunc* raygen = nullptr;
     IRFunc* closestHit = nullptr;
-    IRFunc* miss = nullptr;
+    List<IRFunc*> missShaders;  // Ordered by appearance (corresponds to MissShaderIndex)
     IRFunc* anyHit = nullptr;
     IRFunc* intersection = nullptr;
     IRInst* raygenFuncTable = nullptr;
@@ -249,8 +249,7 @@ static RTEntryPoints findRTEntryPoints(IRModule* module)
                 result.closestHit = func;
             break;
         case Stage::Miss:
-            if (!result.miss)
-                result.miss = func;
+            result.missShaders.add(func);
             break;
         case Stage::AnyHit:
             if (!result.anyHit)
@@ -604,15 +603,16 @@ static void legalizeTraceRayCalls(IRFunc* raygenFunc, const RTEntryPoints& entry
     for (auto call : traceRayCalls)
     {
         // __metalrt_TraceRay args:
-        // 0: accel, 1: rayFlags, 2: instanceMask, 3: origin, 4: tMin, 5: direction, 6: tMax, 7: payload
+        // 0: accel, 1: rayFlags, 2: instanceMask, 3: missIndex,
+        // 4: origin, 5: tMin, 6: direction, 7: tMax, 8: payload
         auto accel = call->getArg(0);
         auto rayFlagsArg = call->getArg(1);
         auto instanceMask = call->getArg(2);
-        auto origin = call->getArg(3);
-        auto tMin = call->getArg(4);
-        auto direction = call->getArg(5);
-        auto tMax = call->getArg(6);
-        auto payloadPtr = call->getArg(7);
+        auto origin = call->getArg(4);
+        auto tMin = call->getArg(5);
+        auto direction = call->getArg(6);
+        auto tMax = call->getArg(7);
+        auto payloadPtr = call->getArg(8);
 
         // Insert before the TraceRay call.
         builder.setInsertBefore(call);
@@ -678,7 +678,7 @@ static void legalizeTraceRayCalls(IRFunc* raygenFunc, const RTEntryPoints& entry
 
         // Inline miss body into missBlock.
         inlineShaderBody(
-            entryPoints.miss,
+            entryPoints.missShaders.getCount() > 0 ? entryPoints.missShaders[0] : nullptr,
             missBlock,
             afterBlock,
             builder,
@@ -704,7 +704,8 @@ static void legalizeVisibleFunction(
     IRBuilder& builder,
     IRModule* module,
     bool isClosestHit,
-    bool isProcedural = false)
+    bool isProcedural = false,
+    IRType* proceduralAttrsType = nullptr)
 {
     auto firstBlock = func->getFirstBlock();
     if (!firstBlock)
@@ -747,7 +748,12 @@ static void legalizeVisibleFunction(
                 auto fieldPtrType = cast<IRPtrTypeBase>(fieldAddr->getDataType());
                 auto fieldType = fieldPtrType->getValueType();
                 bool isPayloadField = (fieldType->getOp() == kIROp_BorrowInOutParamType);
-                bool isAttrsField = isTriangleIntersectionAttrsType(fieldType);
+                // In procedural mode, custom attribute types (not just
+                // BuiltInTriangleIntersectionAttributes) can appear as the attrs field.
+                // Any non-payload field is treated as attrs.
+                bool isAttrsField = isClosestHit
+                    ? !isPayloadField
+                    : isTriangleIntersectionAttrsType(fieldType);
 
                 if (isPayloadField)
                 {
@@ -806,6 +812,9 @@ static void legalizeVisibleFunction(
 
     auto rayFlagsParam = builder.emitParam(uintType);
     builder.addNameHintDecoration(rayFlagsParam, toSlice("rayFlags"));
+
+    // Attrs parameter for procedural closesthit (set below if applicable).
+    IRInst* attrsParam = nullptr;
 
     // Intersection data parameters (closesthit only).
     IRInst* baryParam = nullptr;
@@ -870,6 +879,14 @@ static void legalizeVisibleFunction(
         // Intersection function table parameter (passed from raygen).
         auto funcTableParam = builder.emitParam(uintType);
         builder.addNameHintDecoration(funcTableParam, toSlice("_metalrt_func_table"));
+
+        // For procedural mode, add attrs as the last parameter (passed from raygen
+        // after the intersection function writes to it via ray_data payload).
+        if (isProcedural && proceduralAttrsType)
+        {
+            attrsParam = builder.emitParam(proceduralAttrsType);
+            builder.addNameHintDecoration(attrsParam, toSlice("attrs"));
+        }
     }
 
     // Replace entryPointParams load results with new parameter values.
@@ -881,7 +898,7 @@ static void legalizeVisibleFunction(
         }
         else if (rep.isAttrs && isClosestHit && baryParam)
         {
-            // Construct BuiltInTriangleIntersectionAttributes struct from barycentrics param.
+            // Triangle mode: construct BuiltInTriangleIntersectionAttributes from barycentrics.
             auto insertPoint = firstBlock->getFirstOrdinaryInst();
             if (insertPoint)
             {
@@ -907,6 +924,12 @@ static void legalizeVisibleFunction(
             }
             auto attrsVal = builder.emitLoad(attrsType, attrsVar);
             rep.load->replaceUsesWith(attrsVal);
+        }
+        else if (rep.isAttrs && isClosestHit && isProcedural && attrsParam)
+        {
+            // Procedural mode: custom hit attributes are passed as a function parameter
+            // from raygen, which received them from the intersection function via ray_data payload.
+            rep.load->replaceUsesWith(attrsParam);
         }
     }
 
@@ -1490,6 +1513,36 @@ static void legalizeIntersectionFunction(
     builder.addNameHintDecoration(instIdParam, toSlice("instanceId"));
     builder.addTargetSystemValueDecoration(instIdParam, toSlice("instance_id"));
 
+    // Scan for ReportHit calls to determine attrs type, then add ray_data payload param.
+    IRType* attrsType = nullptr;
+    for (auto block : func->getBlocks())
+    {
+        for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+        {
+            auto call = as<IRCall>(inst);
+            if (!call)
+                continue;
+            if (getMetalRTIntrinsicFromCall(call) == MetalRTIntrinsic::ReportHit)
+            {
+                attrsType = call->getArg(2)->getDataType();
+                break;
+            }
+        }
+        if (attrsType)
+            break;
+    }
+
+    // Add ray_data AttrsType& [[payload]] parameter for passing custom hit attributes
+    // back to the caller via Metal's payload mechanism.
+    IRInst* attrsPayloadParam = nullptr;
+    if (attrsType)
+    {
+        auto rayDataPtrType = builder.getPtrType(attrsType, AddressSpace::MetalRayData);
+        attrsPayloadParam = builder.emitParam(rayDataPtrType);
+        builder.addNameHintDecoration(attrsPayloadParam, toSlice("_metalrt_payload"));
+        builder.addTargetSystemValueDecoration(attrsPayloadParam, toSlice("payload"));
+    }
+
     // Replace resource loads from epParamsGlobal with direct function parameters.
     // Metal intersection functions can only receive device/constant [[buffer(N)]] parameters,
     // not KernelContext. For each non-payload field that is a buffer type, add a parameter.
@@ -1614,6 +1667,7 @@ static void legalizeIntersectionFunction(
 
     // Replace RT intrinsic calls and ReportHit.
     List<IRInst*> instsToRemove;
+    List<IRCall*> reportHitCalls;
     for (auto block : func->getBlocks())
     {
         for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
@@ -1650,13 +1704,10 @@ static void legalizeIntersectionFunction(
                 break;
             case MetalRTIntrinsic::ReportHit:
                 {
-                    // ReportHit(t, kind, attrs) -> return {true, t}.
-                    builder.setInsertBefore(call);
-                    auto tHit = call->getArg(0);
-                    IRInst* acceptArgs[] = {boolTrue, tHit};
-                    auto acceptVal = builder.emitMakeStruct(resultStructType, 2, acceptArgs);
-                    builder.emitReturn(acceptVal);
-                    instsToRemove.add(call);
+                    // Defer ReportHit processing to a second pass below.
+                    // Block structure changes (splitting) can't safely happen
+                    // while iterating the instruction list.
+                    reportHitCalls.add(call);
                 }
                 break;
             case MetalRTIntrinsic::ObjectRayOrigin:
@@ -1720,6 +1771,67 @@ static void legalizeIntersectionFunction(
         }
     }
 
+    // Process ReportHit calls: add distance range check per Metal requirements.
+    //
+    // Metal's intersection function must return accept=true ONLY when the
+    // distance is within [min_distance, max_distance]. Returning a distance
+    // outside this range is undefined behavior (Apple WWDC20 "Discover Ray
+    // Tracing with Metal"). DXR's ReportHit validates this internally.
+    //
+    // We emit:
+    //   if (t >= minDist && t <= maxDist) { store(payload, attrs); return {true, t}; }
+    // If the check fails, execution falls through to the next ReportHit or
+    // the default return {false, 0.0f}, correctly modeling DXR's semantics
+    // where ReportHit does not terminate the intersection function.
+    for (auto rhCall : reportHitCalls)
+    {
+        auto tHit = rhCall->getArg(0);
+        auto attrs = rhCall->getArg(2);
+
+        builder.setInsertBefore(rhCall);
+
+        // Range check: tHit >= minDistParam && tHit <= maxDistParam
+        auto geqMinDist = builder.emitGeq(tHit, minDistParam);
+        auto leqMaxDist = builder.emitGeq(maxDistParam, tHit);
+        auto inRange = builder.emitAnd(boolType, geqMinDist, leqMaxDist);
+
+        // Split the block: create accept and continue blocks.
+        auto acceptBlock = builder.createBlock();
+        auto continueBlock = builder.createBlock();
+        func->addBlock(acceptBlock);
+        func->addBlock(continueBlock);
+
+        // Move all instructions after the ReportHit call to continueBlock.
+        // This preserves the original block's terminator (e.g. branch to the
+        // next if-check for t.y), so execution falls through when out of range.
+        {
+            List<IRInst*> instsToMoveToContBlock;
+            for (auto moveInst = rhCall->getNextInst(); moveInst;
+                 moveInst = moveInst->getNextInst())
+            {
+                instsToMoveToContBlock.add(moveInst);
+            }
+            for (auto moveInst : instsToMoveToContBlock)
+            {
+                moveInst->insertAtEnd(continueBlock);
+            }
+        }
+
+        // Emit conditional branch: in range -> accept, out of range -> continue.
+        builder.emitIfElse(inRange, acceptBlock, continueBlock, continueBlock);
+
+        // Populate accept block: store attrs to payload, return {true, t}.
+        builder.setInsertInto(acceptBlock);
+        if (attrsPayloadParam)
+            builder.emitStore(attrsPayloadParam, attrs);
+        IRInst* acceptArgs[] = {boolTrue, tHit};
+        auto acceptVal = builder.emitMakeStruct(resultStructType, 2, acceptArgs);
+        builder.emitReturn(acceptVal);
+
+        // Remove the ReportHit call from the continue block.
+        rhCall->removeAndDeallocate();
+    }
+
     // Remove replaced instructions.
     for (auto inst : instsToRemove)
     {
@@ -1763,7 +1875,8 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
     IRFunc* raygenFunc,
     const RTEntryPoints& entryPoints,
     IRBuilder& builder,
-    bool isProcedural = false)
+    bool isProcedural = false,
+    IRType* proceduralAttrsType = nullptr)
 {
     // Find all TraceRay calls in the raygen function.
     List<IRCall*> traceRayCalls;
@@ -1787,29 +1900,68 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
 
     for (auto call : traceRayCalls)
     {
-        // __metalrt_TraceRay args:
-        // 0: accel, 1: rayFlags, 2: instanceMask, 3: origin, 4: tMin, 5: direction, 6: tMax, 7: payload
+        // __metalrt_TraceRay args (updated with MissShaderIndex):
+        // 0: accel, 1: rayFlags, 2: instanceMask, 3: missIndex,
+        // 4: origin, 5: tMin, 6: direction, 7: tMax, 8: payload
         auto accel = call->getArg(0);
         auto rayFlagsArg = call->getArg(1);
         auto instanceMask = call->getArg(2);
-        auto origin = call->getArg(3);
-        auto tMin = call->getArg(4);
-        auto direction = call->getArg(5);
-        auto tMax = call->getArg(6);
-        auto payloadPtr = call->getArg(7);
+        auto missIndexArg = call->getArg(3);
+        auto origin = call->getArg(4);
+        auto tMin = call->getArg(5);
+        auto direction = call->getArg(6);
+        auto tMax = call->getArg(7);
+        auto payloadPtr = call->getArg(8);
 
-        SLANG_UNUSED(tMax);
+        // Check for RAY_FLAG_SKIP_CLOSEST_HIT_SHADER (0x08).
+        // If rayFlags is a compile-time constant, check statically.
+        bool skipClosestHit = false;
+        if (auto flagsLit = as<IRIntLit>(rayFlagsArg))
+        {
+            skipClosestHit = (flagsLit->getValue() & 0x08) != 0;
+        }
+
+        // Determine which miss shader to call.
+        // If missIndex is a constant, use it directly; otherwise fall back to index 0.
+        Index missShaderIdx = 0;
+        if (auto missLit = as<IRIntLit>(missIndexArg))
+        {
+            missShaderIdx = (Index)missLit->getValue();
+        }
+        IRFunc* targetMissFunc = nullptr;
+        if (missShaderIdx < entryPoints.missShaders.getCount())
+        {
+            targetMissFunc = entryPoints.missShaders[missShaderIdx];
+        }
+        else if (entryPoints.missShaders.getCount() > 0)
+        {
+            targetMissFunc = entryPoints.missShaders[0];
+        }
 
         // Insert before the TraceRay call.
         builder.setInsertBefore(call);
 
         // Emit MetalRTIntersect instruction.
-        IRInst* intersectArgs[] = {accel, origin, direction, tMin, tMax, rayFlagsArg, instanceMask};
-        auto intersectResult = builder.emitIntrinsicInst(
-            uintType, // placeholder type — emitter will use `auto`
-            kIROp_MetalRTIntersect,
-            7,
-            intersectArgs);
+        // For procedural mode, use 9-operand form with an attrs variable that the
+        // intersection function writes to via ray_data [[payload]].
+        IRInst* attrsVar = nullptr;
+        IRInst* intersectResult = nullptr;
+        if (isProcedural && proceduralAttrsType)
+        {
+            attrsVar = builder.emitVar(proceduralAttrsType);
+            IRInst* intersectArgs[] = {
+                accel, origin, direction, tMin, tMax,
+                rayFlagsArg, instanceMask, entryPoints.raygenFuncTable, attrsVar};
+            intersectResult = builder.emitIntrinsicInst(
+                uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
+        }
+        else
+        {
+            IRInst* intersectArgs[] = {
+                accel, origin, direction, tMin, tMax, rayFlagsArg, instanceMask};
+            intersectResult = builder.emitIntrinsicInst(
+                uintType, kIROp_MetalRTIntersect, 7, intersectArgs);
+        }
 
         // Emit type check: result type != 0 means we got a hit.
         auto intersectionType = builder.emitIntrinsicInst(
@@ -1848,8 +2000,9 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
         call->removeAndDeallocate();
 
         // Hit branch: call closestHitFunc with intersection result fields as arguments.
+        // If RAY_FLAG_SKIP_CLOSEST_HIT_SHADER is set, skip the closestHit call.
         builder.setInsertInto(hitBlock);
-        if (entryPoints.closestHit)
+        if (entryPoints.closestHit && !skipClosestHit)
         {
             auto floatType = builder.getBasicType(BaseType::Float);
 
@@ -1900,14 +2053,30 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
 
             if (isProcedural)
             {
-                // Procedural mode: no barycentrics or frontFacing (13 args).
-                IRInst* hitArgs[] = {
-                    payloadPtr, origin, direction, tMin, rayFlagsArg,
-                    distance, primitiveId, instanceId,
-                    objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
-                    entryPoints.raygenFuncTable};
-                builder.emitCallInst(
-                    builder.getVoidType(), entryPoints.closestHit, 13, hitArgs);
+                if (proceduralAttrsType && attrsVar)
+                {
+                    // Procedural mode with attrs: load attrs written by intersection
+                    // function via ray_data payload, pass as last arg (14 args).
+                    auto attrsVal = builder.emitLoad(proceduralAttrsType, attrsVar);
+                    IRInst* hitArgs[] = {
+                        payloadPtr, origin, direction, tMin, rayFlagsArg,
+                        distance, primitiveId, instanceId,
+                        objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
+                        entryPoints.raygenFuncTable, attrsVal};
+                    builder.emitCallInst(
+                        builder.getVoidType(), entryPoints.closestHit, 14, hitArgs);
+                }
+                else
+                {
+                    // Procedural mode without attrs (13 args).
+                    IRInst* hitArgs[] = {
+                        payloadPtr, origin, direction, tMin, rayFlagsArg,
+                        distance, primitiveId, instanceId,
+                        objectToWorld4x3, objectToWorld3x4, worldToObject4x3, worldToObject3x4,
+                        entryPoints.raygenFuncTable};
+                    builder.emitCallInst(
+                        builder.getVoidType(), entryPoints.closestHit, 13, hitArgs);
+                }
             }
             else
             {
@@ -1937,13 +2106,13 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
         }
         builder.emitBranch(afterBlock);
 
-        // Miss branch: call missFunc with payload pointer and ray params.
+        // Miss branch: call the appropriate miss function based on MissShaderIndex.
         builder.setInsertInto(missBlock);
-        if (entryPoints.miss)
+        if (targetMissFunc)
         {
             IRInst* missArgs[] = {payloadPtr, origin, direction, tMin, rayFlagsArg};
             builder.emitCallInst(
-                builder.getVoidType(), entryPoints.miss, 5, missArgs);
+                builder.getVoidType(), targetMissFunc, 5, missArgs);
         }
         builder.emitBranch(afterBlock);
     }
@@ -1954,7 +2123,8 @@ static void legalizeTraceRayCallsWithVisibleFunctions(
 // The any-hit function runs automatically during intersect() via the function table.
 static void legalizeTraceRayCallsInVisibleFunctions(
     IRFunc* visibleFunc,
-    IRBuilder& builder)
+    IRBuilder& builder,
+    IRType* proceduralAttrsType = nullptr)
 {
     // Find all TraceRay calls in the visible function.
     List<IRCall*> traceRayCalls;
@@ -1991,28 +2161,41 @@ static void legalizeTraceRayCallsInVisibleFunctions(
     for (auto call : traceRayCalls)
     {
         // __metalrt_TraceRay args:
-        // 0: accel, 1: rayFlags, 2: instanceMask, 3: origin, 4: tMin, 5: direction, 6: tMax,
-        // 7: payload
+        // 0: accel, 1: rayFlags, 2: instanceMask, 3: missIndex,
+        // 4: origin, 5: tMin, 6: direction, 7: tMax, 8: payload
         auto accel = call->getArg(0);
         auto rayFlagsArg = call->getArg(1);
         auto instanceMask = call->getArg(2);
-        auto origin = call->getArg(3);
-        auto tMin = call->getArg(4);
-        auto direction = call->getArg(5);
-        auto tMax = call->getArg(6);
-        auto payloadPtr = call->getArg(7);
+        // missIndex (arg 3) not used for visible function TraceRay lowering.
+        auto origin = call->getArg(4);
+        auto tMin = call->getArg(5);
+        auto direction = call->getArg(6);
+        auto tMax = call->getArg(7);
+        auto payloadPtr = call->getArg(8);
 
         builder.setInsertBefore(call);
 
-        // 9-operand MetalRTIntersect: accel, origin, direction, tMin, tMax,
-        //   rayFlags, instanceMask, funcTable, payloadPtr
-        IRInst* intersectArgs[] = {
-            accel, origin, direction, tMin, tMax,
-            rayFlagsArg, instanceMask, funcTableParam, payloadPtr};
-        builder.emitIntrinsicInst(uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
+        if (proceduralAttrsType)
+        {
+            // Procedural: intersection function expects ray_data AttrsType& [[payload]],
+            // not ray_data DXRPayload&. Pass an attrs variable instead.
+            auto attrsVar = builder.emitVar(proceduralAttrsType);
+            IRInst* intersectArgs[] = {
+                accel, origin, direction, tMin, tMax,
+                rayFlagsArg, instanceMask, funcTableParam, attrsVar};
+            builder.emitIntrinsicInst(uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
+        }
+        else
+        {
+            // Triangle: pass DXR payload (existing behavior).
+            IRInst* intersectArgs[] = {
+                accel, origin, direction, tMin, tMax,
+                rayFlagsArg, instanceMask, funcTableParam, payloadPtr};
+            builder.emitIntrinsicInst(uintType, kIROp_MetalRTIntersect, 9, intersectArgs);
+        }
 
         // Just remove the TraceRay — no block splitting needed.
-        // The any-hit ran during intersect() and modified the payload.
+        // The any-hit/intersection ran during intersect() and modified the payload.
         call->removeAndDeallocate();
     }
 }
@@ -2098,29 +2281,56 @@ void legalizeIRForMetalRT(IRModule* module, TargetProgram* targetProgram, Diagno
 
     bool isProcedural = (entryPoints.intersection != nullptr);
 
-    if (entryPoints.closestHit || entryPoints.miss)
+    // Extract custom hit attributes type from intersection function's ReportHit calls
+    // BEFORE legalization removes them. This type is needed to set up the ray_data payload
+    // mechanism for passing attrs from intersection → raygen → closesthit.
+    IRType* proceduralAttrsType = nullptr;
+    if (entryPoints.intersection)
+    {
+        for (auto block : entryPoints.intersection->getBlocks())
+        {
+            for (auto inst = block->getFirstOrdinaryInst(); inst; inst = inst->getNextInst())
+            {
+                auto call = as<IRCall>(inst);
+                if (!call)
+                    continue;
+                if (getMetalRTIntrinsicFromCall(call) == MetalRTIntrinsic::ReportHit)
+                {
+                    proceduralAttrsType = call->getArg(2)->getDataType();
+                    break;
+                }
+            }
+            if (proceduralAttrsType)
+                break;
+        }
+    }
+
+    if (entryPoints.closestHit || entryPoints.missShaders.getCount() > 0)
     {
         // Phase 3: Transform closesthit/miss into [[visible]] functions.
         if (entryPoints.closestHit)
         {
-            legalizeVisibleFunction(entryPoints.closestHit, builder, module, true, isProcedural);
+            legalizeVisibleFunction(
+                entryPoints.closestHit, builder, module, true, isProcedural, proceduralAttrsType);
         }
-        if (entryPoints.miss)
+        for (auto missFunc : entryPoints.missShaders)
         {
-            legalizeVisibleFunction(entryPoints.miss, builder, module, false);
+            legalizeVisibleFunction(missFunc, builder, module, false);
         }
 
         // Replace TraceRay calls with intersector + calls to visible functions.
         if (raygenFunc)
         {
-            legalizeTraceRayCallsWithVisibleFunctions(raygenFunc, entryPoints, builder, isProcedural);
+            legalizeTraceRayCallsWithVisibleFunctions(
+                raygenFunc, entryPoints, builder, isProcedural, proceduralAttrsType);
         }
 
         // Lower TraceRay calls inside visible functions (e.g. shadow rays in closestHit)
         // to MetalRTIntersect calls with intersection function table and payload.
         if (entryPoints.closestHit)
         {
-            legalizeTraceRayCallsInVisibleFunctions(entryPoints.closestHit, builder);
+            legalizeTraceRayCallsInVisibleFunctions(
+                entryPoints.closestHit, builder, proceduralAttrsType);
         }
     }
 
